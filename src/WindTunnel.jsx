@@ -2413,7 +2413,7 @@ export default function WindTunnel({
 
       {/* --- 3D view: the same solution extruded along the span ------------- */}
       {/* Mirrors the 2D row's grid so both canvases come out the same width. */}
-      <div className={`${styles.body} ${activeTab === '3d' ? '' : styles.tabHidden}`}>
+      <div className={styles.body}>
         <div className={styles.viewport}>
           <canvas
             ref={canvas3dRef}
@@ -2433,6 +2433,25 @@ export default function WindTunnel({
 
         <aside className={styles.panel}>
           <h3 className={styles.panelTitle}>3D view</h3>
+
+          <div className={styles.spanControl}>
+            <label className={styles.label} htmlFor="wt-span">
+              Span{' '}
+              <span className={styles.labelValue}>
+                {spanRatio.toFixed(1)}× = {(spanRatio * chordCm).toFixed(1)} cm
+              </span>
+            </label>
+            <input
+              id="wt-span"
+              className={styles.slider}
+              type="range"
+              min={SPAN_MIN}
+              max={SPAN_MAX}
+              step={0.1}
+              value={spanRatio}
+              onChange={(e) => setSpanRatio(Number(e.target.value))}
+            />
+          </div>
 
           <button type="button" className={styles.resetViewButton} onClick={resetView}>
             Reset view
