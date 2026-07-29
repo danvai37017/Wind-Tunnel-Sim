@@ -1,0 +1,477 @@
+/* WindTunnel — co-located styles. All selectors are locally scoped by CSS
+   Modules, so nothing here can leak into or collide with the host site. */
+
+.root {
+  --wt-bg: #0d1117;
+  --wt-panel: #151b24;
+  --wt-border: #263041;
+  --wt-text: #dfe6f0;
+  --wt-muted: #8b98ab;
+  --wt-accent: #4da3ff;
+  --wt-danger: #ff5c5c;
+  --wt-warn: #ffb648;
+
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--wt-border);
+  border-radius: 12px;
+  background: var(--wt-bg);
+  color: var(--wt-text);
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.root *,
+.root *::before,
+.root *::after {
+  box-sizing: border-box;
+}
+
+/* ---- Tab switch ----------------------------------------------------------- */
+
+.tabBar {
+  display: flex;
+  gap: 8px;
+}
+
+.tabButton {
+  padding: 8px 20px;
+  border: 1px solid var(--wt-border);
+  border-radius: 8px;
+  background: var(--wt-panel);
+  color: var(--wt-muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  cursor: pointer;
+}
+
+.tabButton:hover {
+  color: var(--wt-text);
+  border-color: var(--wt-accent);
+}
+
+.tabButtonActive {
+  background: var(--wt-accent);
+  border-color: var(--wt-accent);
+  color: #06121f;
+}
+
+.tabHidden {
+  display: none !important;
+}
+
+/* ---- Top bar ------------------------------------------------------------ */
+
+.topBar {
+  display: grid;
+  grid-template-columns: minmax(130px, 170px) repeat(4, 1fr);
+  gap: 16px;
+  align-items: end;
+}
+
+@media (max-width: 1100px) {
+  .topBar {
+    grid-template-columns: minmax(130px, 170px) 1fr 1fr;
+  }
+}
+
+.control {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.label {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--wt-muted);
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.labelValue {
+  font-variant-numeric: tabular-nums;
+  color: var(--wt-accent);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.textInput {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--wt-border);
+  border-radius: 8px;
+  background: var(--wt-panel);
+  color: var(--wt-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 15px;
+  letter-spacing: 0.08em;
+  outline: none;
+}
+
+.textInput:focus {
+  border-color: var(--wt-accent);
+  box-shadow: 0 0 0 2px rgb(77 163 255 / 25%);
+}
+
+.textInputError {
+  border-color: var(--wt-danger);
+}
+
+.textInputError:focus {
+  border-color: var(--wt-danger);
+  box-shadow: 0 0 0 2px rgb(255 92 92 / 25%);
+}
+
+.slider {
+  width: 100%;
+  height: 22px;
+  margin: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.slider::-webkit-slider-runnable-track {
+  height: 5px;
+  border-radius: 3px;
+  background: var(--wt-border);
+}
+
+.slider::-moz-range-track {
+  height: 5px;
+  border-radius: 3px;
+  background: var(--wt-border);
+}
+
+.slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -5.5px;
+  border: none;
+  border-radius: 50%;
+  background: var(--wt-accent);
+}
+
+.slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border: none;
+  border-radius: 50%;
+  background: var(--wt-accent);
+}
+
+.slider:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px rgb(77 163 255 / 30%);
+}
+
+/* ---- Inline validation --------------------------------------------------- */
+
+.error,
+.warning {
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.error {
+  border: 1px solid rgb(255 92 92 / 40%);
+  background: rgb(255 92 92 / 10%);
+  color: #ffb3b3;
+}
+
+.warning {
+  border: 1px solid rgb(255 182 72 / 40%);
+  background: rgb(255 182 72 / 10%);
+  color: #ffd79a;
+}
+
+/* ---- Layout -------------------------------------------------------------- */
+
+.body {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+  align-items: start;
+}
+
+.viewport {
+  position: relative;
+  min-width: 0;
+}
+
+.canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--wt-border);
+  border-radius: 8px;
+  background: #0a101e;
+}
+
+.viewportFooter {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.airfoilName {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  color: var(--wt-text);
+}
+
+.infoButton {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--wt-muted);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.infoButton:hover {
+  color: var(--wt-accent);
+}
+
+.infoPanel {
+  margin-top: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--wt-border);
+  border-radius: 8px;
+  background: var(--wt-panel);
+  font-size: 12.5px;
+  color: var(--wt-muted);
+}
+
+.infoPanel p {
+  margin: 0 0 8px;
+}
+
+.infoPanel p:last-child {
+  margin-bottom: 0;
+}
+
+.infoPanel strong {
+  color: var(--wt-text);
+}
+
+/* ---- Stall banner -------------------------------------------------------- */
+
+.stallBanner {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 7px 16px;
+  border: 1px solid rgb(255 92 92 / 60%);
+  border-radius: 999px;
+  background: rgb(28 8 8 / 88%);
+  color: #ff8080;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  pointer-events: none;
+  animation: wtFadeIn 220ms ease-out;
+}
+
+.stallBannerNear {
+  border-color: rgb(255 182 72 / 60%);
+  background: rgb(30 20 4 / 88%);
+  color: var(--wt-warn);
+}
+
+@keyframes wtFadeIn {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -6px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+/* ---- Side panel ---------------------------------------------------------- */
+
+/* Two columns of readouts so the panel's height roughly matches the canvas
+   instead of running far past it and leaving dead space alongside. */
+.panel {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 14px;
+  padding: 12px;
+  border: 1px solid var(--wt-border);
+  border-radius: 10px;
+  background: var(--wt-panel);
+}
+
+.panelTitle {
+  grid-column: 1 / -1;
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--wt-muted);
+}
+
+.readout {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 7px 0;
+  border-bottom: 1px solid rgb(38 48 65 / 60%);
+}
+
+.readout:nth-last-of-type(-n + 2) {
+  border-bottom: none;
+}
+
+.stallChip {
+  grid-column: 1 / -1;
+}
+
+.readoutLabel {
+  font-size: 11.5px;
+  color: var(--wt-muted);
+}
+
+.readoutSymbol {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: #5f6f88;
+}
+
+.readoutValue {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 17px;
+  font-variant-numeric: tabular-nums;
+  color: var(--wt-text);
+}
+
+.readoutUnit {
+  font-size: 11px;
+  color: var(--wt-muted);
+}
+
+.stallChip {
+  margin-top: 10px;
+  padding: 7px 10px;
+  border: 1px solid var(--wt-border);
+  border-radius: 8px;
+  background: rgb(20 26 35 / 80%);
+  color: var(--wt-muted);
+  font-size: 12px;
+  text-align: center;
+  transition: color 180ms ease, border-color 180ms ease, background 180ms ease;
+}
+
+.stallChipActive {
+  border-color: rgb(255 92 92 / 55%);
+  background: rgb(255 92 92 / 12%);
+  color: #ff8080;
+  font-weight: 600;
+}
+
+.stallChipNear {
+  border-color: rgb(255 182 72 / 55%);
+  background: rgb(255 182 72 / 12%);
+  color: var(--wt-warn);
+  font-weight: 600;
+}
+
+.stallChipDetail {
+  display: block;
+  margin-top: 3px;
+  color: var(--wt-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  font-weight: 400;
+}
+
+/* ---- 3D view ------------------------------------------------------------- */
+
+.canvas3d {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--wt-border);
+  border-radius: 8px;
+  background: #0a101e;
+  cursor: grab;
+  touch-action: none; /* let the orbit handler own drags on touch devices */
+}
+
+.canvas3d:active {
+  cursor: grabbing;
+}
+
+.resetViewButton {
+  grid-column: 1 / -1;
+  padding: 7px 12px;
+  border: 1px solid var(--wt-border);
+  border-radius: 8px;
+  background: var(--wt-bg);
+  color: var(--wt-text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.resetViewButton:hover {
+  border-color: var(--wt-accent);
+  color: var(--wt-accent);
+}
+
+.view3dNote {
+  grid-column: 1 / -1;
+  margin: 10px 0 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--wt-muted);
+}
+
+/* ---- Responsive ---------------------------------------------------------- */
+
+@media (max-width: 860px) {
+  .body {
+    grid-template-columns: 1fr;
+  }
+
+  .topBar {
+    grid-template-columns: 1fr;
+  }
+
+  .panel {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 0 14px;
+  }
+
+  .panelTitle,
+  .stallChip {
+    grid-column: 1 / -1;
+  }
+}
