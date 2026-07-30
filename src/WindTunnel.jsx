@@ -26,8 +26,8 @@ const NU_AIR = 1.48e-5; // m^2/s (kinematic viscosity)
 // SPAN_PER_CHORD chords, so planform area S = span * chord and the reported
 // forces are whole-wing Newtons. The span is a control (see the 3D view), and
 // the 2D cross-section is the mid-span station, extruded equally either way.
-const SPAN_MIN = 4;
-const SPAN_MAX = 12;
+const SPAN_MIN = 1;
+const SPAN_MAX = 10;
 const SPAN_DEFAULT = 4;
 
 // --- 3D viewport ----------------------------------------------------------
@@ -1899,6 +1899,8 @@ export default function WindTunnel({
   const camRef = useRef(null);
   const spanRatioRef = useRef(spanRatio);
   spanRatioRef.current = spanRatio;
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
   if (solverRef.current === null) solverRef.current = createSolver();
   if (streaksRef.current === null) streaksRef.current = createStreaks();
   if (camRef.current === null) camRef.current = createCamera();
@@ -1990,7 +1992,7 @@ export default function WindTunnel({
       advanceStreaks(St, S, airspeedRef.current, dt);
       renderFrame(ctx, field, fieldCtx, fieldImage, S, geoRef.current, St);
 
-      if (ctx3d && geoRef.current) {
+      if (ctx3d && geoRef.current && activeTabRef.current === '3d') {
         render3D(
           ctx3d,
           S,
@@ -2175,6 +2177,11 @@ export default function WindTunnel({
         >
           3D
         </button>
+        {activeTab === '3d' && (
+          <button type="button" className={styles.resetViewButton} onClick={resetView}>
+            Reset view
+          </button>
+        )}
       </div>
 
       <div className={styles.topBar}>
@@ -2270,16 +2277,7 @@ export default function WindTunnel({
         <div className={styles.viewport}>
           <canvas ref={canvasRef} width={CANVAS_W} height={CANVAS_H} className={styles.canvas} />
 
-          {readings.stallState !== 'none' && (
-            <div
-              className={`${styles.stallBanner} ${
-                readings.stallState === 'near' ? styles.stallBannerNear : ''
-              }`}
-              role="status"
-            >
-              {readings.stallState === 'stall' ? '⚠ STALL' : '⚠ NEAR STALL'}
-            </div>
-          )}
+          <StallBanner state={readings.stallState} />
 
           <div className={styles.viewportFooter}>
             <span className={styles.airfoilName}>{spec.label}</span>
@@ -2335,85 +2333,13 @@ export default function WindTunnel({
 
         <aside className={styles.panel}>
           <h3 className={styles.panelTitle}>Live readings</h3>
-
-          <Readout label="Lift coefficient" symbol="Cl" value={readings.cl.toFixed(3)} unit="" />
-          <Readout label="Drag coefficient" symbol="Cd" value={readings.cd.toFixed(4)} unit="" />
-          <Readout
-            label="Airspeed"
-            symbol="V∞"
-            value={readings.airspeed.toFixed(0)}
-            unit="m/s"
-          />
-          <Readout
-            label="Reynolds number"
-            symbol="Re"
-            value={formatSci(readings.reynolds)}
-            unit=""
-          />
-          <Readout label="Lift force" symbol="L" value={readings.liftForce.toFixed(2)} unit="N" />
-          <Readout label="Drag force" symbol="D" value={readings.dragForce.toFixed(3)} unit="N" />
-          <Readout
-            label="Dynamic pressure"
-            symbol="q"
-            value={readings.dynamicPressure.toFixed(0)}
-            unit="Pa"
-          />
-          <Readout
-            label="Planform area"
-            symbol="S"
-            value={readings.planformCm2.toFixed(1)}
-            unit="cm²"
-          />
-          <Readout
-            label="Critical AoA"
-            symbol="α*"
-            value={readings.criticalAoa.toFixed(1)}
-            unit="°"
-          />
-          <Readout
-            label="Separation point"
-            symbol="x/c"
-            // Anything past 0.95 chord is the trailing edge, which the detector
-            // itself declines to call separation; while the smoothed value is
-            // relaxing back through that region, report it as attached rather
-            // than showing a number that contradicts the state chip.
-            value={
-              readings.separationPoint < 0 || readings.separationPoint > 0.95
-                ? '—'
-                : readings.separationPoint.toFixed(2)
-            }
-            unit={
-              readings.separationPoint < 0 || readings.separationPoint > 0.95
-                ? 'attached'
-                : 'of chord'
-            }
-          />
-
-          <div
-            className={`${styles.stallChip} ${
-              readings.stallState === 'stall'
-                ? styles.stallChipActive
-                : readings.stallState === 'near'
-                  ? styles.stallChipNear
-                  : ''
-            }`}
-          >
-            {readings.stallState === 'stall'
-              ? 'Stall'
-              : readings.stallState === 'near'
-                ? 'Near stall'
-                : 'Attached'}
-            <span className={styles.stallChipDetail}>
-              dC<sub>L</sub>/dα = {readings.liftSlope.toFixed(4)} /° (
-              {(readings.slopeFraction * 100).toFixed(0)}%)
-            </span>
-          </div>
+          <LiveReadings readings={readings} />
         </aside>
       </div>
 
       {/* --- 3D view: the same solution extruded along the span ------------- */}
       {/* Mirrors the 2D row's grid so both canvases come out the same width. */}
-      <div className={styles.body}>
+      <div className={`${styles.body} ${activeTab === '3d' ? '' : styles.tabHidden}`}>
         <div className={styles.viewport}>
           <canvas
             ref={canvas3dRef}
@@ -2421,6 +2347,9 @@ export default function WindTunnel({
             height={VIEW3D_H}
             className={styles.canvas3d}
           />
+
+          <StallBanner state={readings.stallState} />
+
           <div className={styles.viewportFooter}>
             <span className={styles.airfoilName}>
               {spec.label} · span {(spanRatio * chordCm).toFixed(1)} cm
@@ -2434,38 +2363,105 @@ export default function WindTunnel({
         <aside className={styles.panel}>
           <h3 className={styles.panelTitle}>3D view</h3>
 
-          <div className={styles.spanControl}>
-            <label className={styles.label} htmlFor="wt-span">
-              Span{' '}
-              <span className={styles.labelValue}>
-                {spanRatio.toFixed(1)}× = {(spanRatio * chordCm).toFixed(1)} cm
-              </span>
-            </label>
-            <input
-              id="wt-span"
-              className={styles.slider}
-              type="range"
-              min={SPAN_MIN}
-              max={SPAN_MAX}
-              step={0.1}
-              value={spanRatio}
-              onChange={(e) => setSpanRatio(Number(e.target.value))}
-            />
-          </div>
-
-          <button type="button" className={styles.resetViewButton} onClick={resetView}>
-            Reset view
-          </button>
-
           <p className={styles.view3dNote}>
             The section is extruded equally either side of the mid-span plane, and that centre
             cross-section is exactly what the 2D view above shows. The solve is 2D, so every
             spanwise station sees the same flow — no tip vortices or downwash. That is the same
             uniform-section assumption the C<sub>L</sub> readout already makes.
           </p>
+
+          <LiveReadings readings={readings} />
         </aside>
       </div>
     </div>
+  );
+}
+
+/** Stall/near-stall banner, shared by the 2D and 3D viewports. */
+function StallBanner({ state }) {
+  if (state === 'none') return null;
+  return (
+    <div
+      className={`${styles.stallBanner} ${state === 'near' ? styles.stallBannerNear : ''}`}
+      role="status"
+    >
+      {state === 'stall' ? '⚠ STALL' : '⚠ NEAR STALL'}
+    </div>
+  );
+}
+
+/** Full readouts + stall chip, shared by the 2D and 3D side panels. */
+function LiveReadings({ readings }) {
+  return (
+    <>
+      <Readout label="Lift coefficient" symbol="Cl" value={readings.cl.toFixed(3)} unit="" />
+      <Readout label="Drag coefficient" symbol="Cd" value={readings.cd.toFixed(4)} unit="" />
+      <Readout label="Airspeed" symbol="V∞" value={readings.airspeed.toFixed(0)} unit="m/s" />
+      <Readout
+        label="Reynolds number"
+        symbol="Re"
+        value={formatSci(readings.reynolds)}
+        unit=""
+      />
+      <Readout label="Lift force" symbol="L" value={readings.liftForce.toFixed(2)} unit="N" />
+      <Readout label="Drag force" symbol="D" value={readings.dragForce.toFixed(3)} unit="N" />
+      <Readout
+        label="Dynamic pressure"
+        symbol="q"
+        value={readings.dynamicPressure.toFixed(0)}
+        unit="Pa"
+      />
+      <Readout
+        label="Reference area"
+        symbol="S"
+        value={readings.planformCm2.toFixed(1)}
+        unit="cm²"
+      />
+      <Readout
+        label="Critical AoA"
+        symbol="α*"
+        value={readings.criticalAoa.toFixed(1)}
+        unit="°"
+      />
+      <Readout
+        label="Separation point"
+        symbol="x/c"
+        // Anything past 0.95 chord is the trailing edge, which the detector
+        // itself declines to call separation; while the smoothed value is
+        // relaxing back through that region, report it as attached rather
+        // than showing a number that contradicts the state chip.
+        value={
+          readings.separationPoint < 0 || readings.separationPoint > 0.95
+            ? '—'
+            : readings.separationPoint.toFixed(2)
+        }
+        unit={
+          readings.separationPoint < 0 || readings.separationPoint > 0.95
+            ? 'attached'
+            : 'of chord'
+        }
+      />
+
+      <div
+        className={`${styles.stallChip} ${
+          readings.stallState === 'stall'
+            ? styles.stallChipActive
+            : readings.stallState === 'near'
+              ? styles.stallChipNear
+              : ''
+        }`}
+      >
+        {readings.stallState === 'stall'
+          ? 'Stall'
+          : readings.stallState === 'near'
+            ? 'Near stall'
+            : 'Attached'}
+        <span className={styles.stallChipDetail}>
+          dC<sub>L</sub>/dα = {readings.liftSlope.toFixed(4)} /° (
+          {(readings.slopeFraction * 100).toFixed(0)}%)
+        </span>
+      </div>
+    </>
   );
 }
 

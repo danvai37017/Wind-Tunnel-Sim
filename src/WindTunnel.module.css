@@ -35,6 +35,7 @@
 
 .tabBar {
   display: flex;
+  align-items: center;
   gap: 8px;
 }
 
@@ -60,6 +61,24 @@
   background: var(--wt-accent);
   border-color: var(--wt-accent);
   color: #06121f;
+}
+
+.resetViewButton {
+  margin-left: auto;
+  padding: 8px 14px;
+  border: 1px solid var(--wt-border);
+  border-radius: 8px;
+  background: var(--wt-panel);
+  color: var(--wt-muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.resetViewButton:hover {
+  border-color: var(--wt-accent);
+  color: var(--wt-accent);
 }
 
 .tabHidden {
@@ -426,23 +445,6 @@
 
 .canvas3d:active {
   cursor: grabbing;
-}
-
-.resetViewButton {
-  grid-column: 1 / -1;
-  padding: 7px 12px;
-  border: 1px solid var(--wt-border);
-  border-radius: 8px;
-  background: var(--wt-bg);
-  color: var(--wt-text);
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.resetViewButton:hover {
-  border-color: var(--wt-accent);
-  color: var(--wt-accent);
 }
 
 .view3dNote {
