@@ -146,10 +146,15 @@ const RE_SIM_MAX = (U_LAT * REF_CELLS) / ((TAU_MIN - 0.5) / 3);
 const SCALE = 2; // canvas pixels per lattice cell
 const CANVAS_W = NX * SCALE;
 const CANVAS_H = NY * SCALE;
+// Streak buffer and molecule count. The max buffer size avoids re-allocating
+// when the user slides the molecule count; only activeCount particles are alive.
+const STREAK_MAX = 2000;
+const STREAK_DEFAULT = 700;
+
 // Streak ribbons: tracer particles advected by the live velocity field, drawn
 // as tapered trails. Replaces the old fixed-grid arrow glyphs, which could only
-// twitch in place rather than glide.
-const STREAK_COUNT = 700;
+// twitch in place rather than drift.
+const STREAK_COUNT = STREAK_MAX;
 const STREAK_TRAIL = 16; // stored points per ribbon (upper bound)
 const STREAK_TRAIL_MIN = 9; // shortest ribbon, so lengths vary and don't band
 const STREAK_SEG_CELLS = 1.9; // lattice cells between stored points
@@ -521,11 +526,105 @@ function stallState(alphaDeg, M) {
   return 'none';
 }
 
+/* ============================================================================
+ * 3b. Geometry type system and Clark Y data
+ * ==========================================================================*/
+
+const GEO_NACA = 'naca';
+const GEO_CLARKY = 'clarky';
+const GEO_FLATPLATE = 'flatplate';
+const GEO_CYLINDER = 'cylinder';
+
+const HEATMAP_NONE = 'none';
+const HEATMAP_CP = 'cp';
+const HEATMAP_VELOCITY = 'velocity';
+const HEATMAP_DYNAMIC_PRESSURE = 'dynamic_pressure';
+const HEATMAP_VORTICITY = 'vorticity';
+
+const GEOMETRY_LABELS = {
+  [GEO_NACA]: 'NACA Airfoil',
+  [GEO_CLARKY]: 'Clark Y',
+  [GEO_FLATPLATE]: 'Flat Plate',
+  [GEO_CYLINDER]: 'Cylinder',
+};
+
+const HEATMAP_LABELS = {
+  [HEATMAP_NONE]: 'None',
+  [HEATMAP_CP]: 'Pressure Cp',
+  [HEATMAP_VELOCITY]: 'Velocity',
+  [HEATMAP_DYNAMIC_PRESSURE]: 'Dynamic Pressure',
+  [HEATMAP_VORTICITY]: 'Vorticity',
+};
+
+/* Clark Y airfoil coordinates (normalised to unit chord).
+ * Standard flat-bottom section, widely used in model aircraft. */
+const CLARKY_POINTS = [
+  { upper: [0, 0], lower: [0, 0] },
+  { upper: [0.005, 0.0159], lower: [0.005, -0.0092] },
+  { upper: [0.0125, 0.0244], lower: [0.0125, -0.0129] },
+  { upper: [0.025, 0.0337], lower: [0.025, -0.0167] },
+  { upper: [0.05, 0.0462], lower: [0.05, -0.0196] },
+  { upper: [0.075, 0.0541], lower: [0.075, -0.02] },
+  { upper: [0.1, 0.0594], lower: [0.1, -0.0196] },
+  { upper: [0.15, 0.0667], lower: [0.15, -0.0179] },
+  { upper: [0.2, 0.0713], lower: [0.2, -0.0158] },
+  { upper: [0.25, 0.0744], lower: [0.25, -0.0133] },
+  { upper: [0.3, 0.0764], lower: [0.3, -0.0108] },
+  { upper: [0.4, 0.0778], lower: [0.4, -0.0063] },
+  { upper: [0.5, 0.0759], lower: [0.5, -0.0033] },
+  { upper: [0.6, 0.0703], lower: [0.6, -0.0013] },
+  { upper: [0.7, 0.0608], lower: [0.7, 0] },
+  { upper: [0.8, 0.0474], lower: [0.8, 0.0013] },
+  { upper: [0.9, 0.0304], lower: [0.9, 0.0017] },
+  { upper: [1.0, 0], lower: [1.0, 0] },
+];
+
 const N_SURFACE = 200; // sample points per surface (cosine-spaced)
 
+/* ---- Colour scale presets for heat maps ---------------------------------- */
+const COLOR_SCALE_JET = 'jet';
+const COLOR_SCALE_HOT = 'hot';
+
+const COLOR_SCALE_LABELS = {
+  [COLOR_SCALE_JET]: 'Jet',
+  [COLOR_SCALE_HOT]: 'Hot',
+};
+
 /**
- * Build the unit-chord upper/lower surfaces.
- * Returns chordwise stations plus the two surface point lists, LE -> TE.
+ * Map a normalised value t ∈ [0, 1] to a colour using a named scale.
+ * Returns an { r, g, b } object with 0-255 byte values.
+ */
+function heatColor(t, scale = COLOR_SCALE_JET) {
+  const tc = Math.max(0, Math.min(1, t));
+
+  if (scale === COLOR_SCALE_HOT) {
+    const r = Math.min(255, tc * 510);
+    const g = Math.min(255, Math.max(0, tc * 510 - 255));
+    const b = Math.max(0, tc * 510 - 510);
+    return { r: (r | 0), g: (g | 0), b: (b | 0) };
+  }
+
+  // Jet colormap: dark blue → blue → cyan → green → yellow → red
+  let r, g, bVal;
+  const x = tc;
+  if (x < 0.125) {
+    r = 0; g = 0; bVal = 0.5 + 4 * x;
+  } else if (x < 0.375) {
+    r = 0; g = 4 * (x - 0.125); bVal = 1;
+  } else if (x < 0.5) {
+    r = 0; g = 1; bVal = 1 - 8 * (x - 0.375);
+  } else if (x < 0.625) {
+    r = 8 * (x - 0.5); g = 1; bVal = 0;
+  } else if (x < 0.875) {
+    r = 1; g = 1 - 4 * (x - 0.625); bVal = 0;
+  } else {
+    r = 1; g = 0; bVal = 0;
+  }
+  return { r: Math.round(r * 255), g: Math.round(g * 255), b: Math.round(bVal * 255) };
+}
+
+/**
+ * Build the unit-chord upper/lower surfaces for a NACA airfoil.
  */
 function buildSurfaces(spec) {
   const xs = new Float64Array(N_SURFACE);
@@ -533,7 +632,6 @@ function buildSurfaces(spec) {
   const lower = new Float64Array(N_SURFACE * 2);
 
   for (let j = 0; j < N_SURFACE; j++) {
-    // Cosine spacing clusters points at the leading edge, where curvature is highest.
     const beta = (Math.PI * j) / (N_SURFACE - 1);
     const x = 0.5 * (1 - Math.cos(beta));
     xs[j] = x;
@@ -551,6 +649,157 @@ function buildSurfaces(spec) {
   }
 
   return { xs, upper, lower };
+}
+
+/**
+ * Interpolate Clark Y data onto the cosine-spaced grid.
+ * The Clark Y has an essentially flat lower surface (characteristic of
+ * model-aircraft sections), which creates a different C_p distribution
+ * from a comparable NACA section.
+ */
+function buildClarkYSurfaces() {
+  const xs = new Float64Array(N_SURFACE);
+  const upper = new Float64Array(N_SURFACE * 2);
+  const lower = new Float64Array(N_SURFACE * 2);
+
+  const nSrc = CLARKY_POINTS.length;
+
+  for (let j = 0; j < N_SURFACE; j++) {
+    const beta = (Math.PI * j) / (N_SURFACE - 1);
+    const x = 0.5 * (1 - Math.cos(beta));
+    xs[j] = x;
+
+    // Find the straddling Clark Y points and linearly interpolate.
+    let i0 = 0;
+    let i1 = nSrc - 1;
+    for (let k = 0; k < nSrc - 1; k++) {
+      if (x >= CLARKY_POINTS[k].upper[0] && x <= CLARKY_POINTS[k + 1].upper[0]) {
+        i0 = k;
+        i1 = k + 1;
+        break;
+      }
+    }
+    const x0 = CLARKY_POINTS[i0].upper[0];
+    const x1 = CLARKY_POINTS[i1].upper[0];
+    const f = x0 === x1 ? 0 : (x - x0) / (x1 - x0);
+
+    upper[2 * j] = x;
+    upper[2 * j + 1] = CLARKY_POINTS[i0].upper[1] + f * (CLARKY_POINTS[i1].upper[1] - CLARKY_POINTS[i0].upper[1]);
+    lower[2 * j] = x;
+    lower[2 * j + 1] = CLARKY_POINTS[i0].lower[1] + f * (CLARKY_POINTS[i1].lower[1] - CLARKY_POINTS[i0].lower[1]);
+  }
+
+  return { xs, upper, lower };
+}
+
+/**
+ * Build a zero-thickness flat plate from x = 0 to x = 1.
+ * Upper and lower surfaces coincide; the panel method receives
+ * a vanishingly thin body and the LBM rasteriser gets a line.
+ */
+function buildFlatPlateSurfaces() {
+  const xs = new Float64Array(N_SURFACE);
+  const upper = new Float64Array(N_SURFACE * 2);
+  const lower = new Float64Array(N_SURFACE * 2);
+  const halfT = 0.015;
+
+  for (let j = 0; j < N_SURFACE; j++) {
+    const beta = (Math.PI * j) / (N_SURFACE - 1);
+    const x = 0.5 * (1 - Math.cos(beta));
+    xs[j] = x;
+    upper[2 * j] = x;
+    upper[2 * j + 1] = halfT;
+    lower[2 * j] = x;
+    lower[2 * j + 1] = -halfT;
+  }
+
+  return { xs, upper, lower };
+}
+
+/**
+ * Build a circular cylinder / sphere cross-section of unit diameter,
+ * centred at (0.5, 0). The "upper" surface is the upper half of the
+ * circle and "lower" surface the lower half, both traversed LE -> TE.
+ */
+function buildCircleSurfaces() {
+  const xs = new Float64Array(N_SURFACE);
+  const upper = new Float64Array(N_SURFACE * 2);
+  const lower = new Float64Array(N_SURFACE * 2);
+
+  for (let j = 0; j < N_SURFACE; j++) {
+    const beta = (Math.PI * j) / (N_SURFACE - 1);
+    // Map beta = 0..PI to theta = PI..0 so the front (x=0) is at theta=PI
+    // and the rear (x=1) is at theta=0.
+    const theta = Math.PI * (1 - beta / Math.PI);
+    const x = 0.5 + 0.5 * Math.cos(theta);
+    const y = 0.5 * Math.sin(theta);
+    xs[j] = x;
+    upper[2 * j] = x;
+    upper[2 * j + 1] = y;
+    lower[2 * j] = x;
+    lower[2 * j + 1] = -y;
+  }
+
+  return { xs, upper, lower };
+}
+
+/**
+ * Dispatch geometry generation by type. Every geometry type returns
+ * the same { xs, upper, lower } contract so the rest of the pipeline
+ * (placement, rasterisation, panel method) works unchanged.
+ */
+function buildGeometry(geoType, spec) {
+  switch (geoType) {
+    case GEO_CLARKY:
+      return buildClarkYSurfaces();
+    case GEO_FLATPLATE:
+      return buildFlatPlateSurfaces();
+    case GEO_CYLINDER:
+      return buildCircleSurfaces();
+    default:
+      return buildSurfaces(spec);
+  }
+}
+
+/**
+ * Return a surfacePoint(x, side) callback for panel-node construction.
+ * side = +1 for upper, -1 for lower.
+ */
+function makeSurfacePointCb(geoType, spec) {
+  switch (geoType) {
+    case GEO_CLARKY: {
+      const nSrc = CLARKY_POINTS.length;
+      return (x, side) => {
+        let i0 = 0, i1 = nSrc - 1;
+        for (let k = 0; k < nSrc - 1; k++) {
+          if (x >= CLARKY_POINTS[k].upper[0] && x <= CLARKY_POINTS[k + 1].upper[0]) {
+            i0 = k; i1 = k + 1; break;
+          }
+        }
+        const x0 = CLARKY_POINTS[i0].upper[0], x1 = CLARKY_POINTS[i1].upper[0];
+        const f = x0 === x1 ? 0 : (x - x0) / (x1 - x0);
+        const yu = CLARKY_POINTS[i0].upper[1] + f * (CLARKY_POINTS[i1].upper[1] - CLARKY_POINTS[i0].upper[1]);
+        const yl = CLARKY_POINTS[i0].lower[1] + f * (CLARKY_POINTS[i1].lower[1] - CLARKY_POINTS[i0].lower[1]);
+        const y = side > 0 ? yu : yl;
+        return [x, y];
+      };
+    }
+    case GEO_FLATPLATE:
+      return (x, _side) => [x, 0];
+    case GEO_CYLINDER:
+      return (x, side) => {
+        const theta = Math.acos(2 * x - 1);
+        const y = 0.5 * Math.sin(theta);
+        return [x, side > 0 ? y : -y];
+      };
+    default:
+      return (x, side) => {
+        const yt = thickness(x, spec.t);
+        const [yc, dyc] = camber(x, spec);
+        const th = Math.atan(dyc);
+        return [x - side * yt * Math.sin(th), yc + side * yt * Math.cos(th)];
+      };
+  }
 }
 
 /* ============================================================================
@@ -1034,21 +1283,18 @@ function speedColor(f) {
 
 /* ---- Streak ribbons ------------------------------------------------------ */
 
-function createStreaks() {
+function createStreaks(activeCount) {
   return {
+    activeCount: activeCount ?? STREAK_DEFAULT,
     x: new Float32Array(STREAK_COUNT),
     y: new Float32Array(STREAK_COUNT),
     tx: new Float32Array(STREAK_COUNT * STREAK_TRAIL),
     ty: new Float32Array(STREAK_COUNT * STREAK_TRAIL),
     head: new Uint8Array(STREAK_COUNT),
     count: new Uint8Array(STREAK_COUNT),
-    cap: new Uint8Array(STREAK_COUNT), // per-ribbon length, varied to avoid banding
-    // Spanwise station as a fraction of span in [-0.5, 0.5]. The solve is 2D and
-    // uniform along span, so a tracer keeps a fixed z while its (x, y) follows
-    // the same field the 2D view uses. Stored as a fraction so the span slider
-    // rescales the 3D view without disturbing any particle.
+    cap: new Uint8Array(STREAK_COUNT),
     sz: new Float32Array(STREAK_COUNT),
-    since: new Float32Array(STREAK_COUNT), // cells travelled since last stored point
+    since: new Float32Array(STREAK_COUNT),
     age: new Float32Array(STREAK_COUNT),
     phase: 0,
     seeded: false,
@@ -1087,7 +1333,8 @@ function spawnStreak(St, i, S, seedAnywhere) {
 }
 
 function resetStreaks(St, S) {
-  for (let i = 0; i < STREAK_COUNT; i++) spawnStreak(St, i, S, true);
+  const n = St.activeCount;
+  for (let i = 0; i < n; i++) spawnStreak(St, i, S, true);
   St.seeded = true;
 }
 
@@ -1132,7 +1379,8 @@ function advanceStreaks(St, S, vInf, dt) {
   const glide = cellsPerFrame / sub / U_LAT; // multiplies raw lattice velocity
   const subDt = dt / sub;
 
-  for (let i = 0; i < STREAK_COUNT; i++) {
+  const nStr = St.activeCount;
+  for (let i = 0; i < nStr; i++) {
     for (let s = 0; s < sub; s++) {
       sampleVelocity(S, St.x[i], St.y[i], VEL);
       const dx = VEL[0] * glide;
@@ -1181,8 +1429,9 @@ const RY = new Float64Array(STREAK_TRAIL);
  */
 function drawStreaks(ctx, St, S) {
   const vMax = U_LAT * 1.9;
+  const nStr = St.activeCount;
 
-  for (let i = 0; i < STREAK_COUNT; i++) {
+  for (let i = 0; i < nStr; i++) {
     const n = St.count[i];
     if (n < 3) continue;
 
@@ -1232,16 +1481,16 @@ function drawStreaks(ctx, St, S) {
   }
 }
 
-function renderFrame(ctx, field, fieldCtx, fieldImage, S, geo, St) {
-  const { spd, solid } = S;
+function renderFrame(ctx, field, fieldCtx, fieldImage, S, geo, St, opts = {}) {
+  const { spd, solid, ux, uy } = S;
   const data = fieldImage.data;
 
-  // Background: speed magnitude, kept monochrome so the coloured ribbons read clearly.
+  // Background: speed magnitude.
   const vMax = U_LAT * 1.9;
   for (let y = 0; y < NY; y++) {
     for (let x = 0; x < NX; x++) {
       const id = y * NX + x;
-      const p = ((NY - 1 - y) * NX + x) * 4; // image rows run top-down
+      const p = ((NY - 1 - y) * NX + x) * 4;
       if (solid[id]) {
         data[p] = 22;
         data[p + 1] = 26;
@@ -1261,9 +1510,9 @@ function renderFrame(ctx, field, fieldCtx, fieldImage, S, geo, St) {
   ctx.imageSmoothingEnabled = true;
   ctx.drawImage(field, 0, 0, CANVAS_W, CANVAS_H);
 
-  drawStreaks(ctx, St, S);
+  if (S && St) drawStreaks(ctx, St, S);
 
-  // Airfoil.
+  // Geometry outline (airfoil / body).
   if (geo) {
     ctx.beginPath();
     for (let i = 0; i < geo.polyCount; i++) {
@@ -1363,13 +1612,14 @@ function project(P3, x, y, z) {
 const DRAW = [];
 const ORDER = [];
 let drawLen = 0;
-function pushDraw(depth, kind, index, shade) {
-  if (drawLen === DRAW.length) DRAW.push({ depth: 0, kind: 0, index: 0, shade: 0 });
+function pushDraw(depth, kind, index, shade, col) {
+  if (drawLen === DRAW.length) DRAW.push({ depth: 0, kind: 0, index: 0, shade: 0, col: '' });
   const d = DRAW[drawLen++];
   d.depth = depth;
   d.kind = kind;
   d.index = index;
   d.shade = shade;
+  d.col = col;
   ORDER.push(d);
 }
 const byDepthDesc = (a, b) => b.depth - a.depth;
@@ -1387,6 +1637,10 @@ const FAR_Y = new Float64Array(WING_CAP);
 const FAR_D = new Float64Array(WING_CAP);
 const WING_SHADE = new Float64Array(WING_CAP);
 const WING_OK = new Uint8Array(WING_CAP);
+const WING_HR = new Float64Array(WING_CAP);
+const WING_HG = new Float64Array(WING_CAP);
+const WING_HB = new Float64Array(WING_CAP);
+const SLICE_OK = new Uint8Array(WING_CAP);
 
 /** Faint wireframe of the flow domain, for spatial orientation. */
 function drawDomainBox(ctx, P3, spanCells) {
@@ -1415,12 +1669,142 @@ function drawDomainBox(ctx, P3, spanCells) {
   ctx.stroke();
 }
 
+/* ---- 3D heat-map helpers ------------------------------------------------- */
+
+/**
+ * Build per-vertex Cp values by interpolating the panel solution onto
+ * the outline polygon vertices.
+ */
+function buildCpHeatValues(out, geo, panelSol) {
+  const nPanels = panelSol.n;
+  const nPts = geo.polyCount;
+  const nPerSurf = nPanels / 2; // 80 panels per surface
+
+  // Panel order: lower surface TE→LE (i=0..79), upper surface LE→TE (i=80..159).
+  // Build SEPARATE interpolation arrays for each surface so Cp values don't
+  // bleed across the chord.
+
+  // Upper surface panels (i=80..159): xFrac already goes 0 (LE) → 1 (TE).
+  const upperX = new Float64Array(nPerSurf);
+  const upperCp = new Float64Array(nPerSurf);
+  for (let i = 0; i < nPerSurf; i++) {
+    upperX[i] = i / (nPerSurf - 1);
+    upperCp[i] = panelSol.cp[nPerSurf + i];
+  }
+
+  // Lower surface panels (i=0..79): xFrac goes 1 (TE) → 0 (LE).
+  // Reverse so it goes 0 (LE) → 1 (TE) for interpolation.
+  const lowerX = new Float64Array(nPerSurf);
+  const lowerCp = new Float64Array(nPerSurf);
+  for (let i = 0; i < nPerSurf; i++) {
+    lowerX[i] = i / (nPerSurf - 1);
+    lowerCp[i] = panelSol.cp[nPerSurf - 1 - i];
+  }
+
+  // Poly order: upper LE→TE (indices 0..N_SURFACE-1),
+  //             lower TE→LE (indices N_SURFACE..2*N_SURFACE-2).
+  for (let j = 0; j < nPts; j++) {
+    if (j < N_SURFACE) {
+      // Upper surface vertex: LE→TE, xFrac from 0→1.
+      const xFrac = j / (N_SURFACE - 1);
+      out[j] = interpolateFromArray(upperX, upperCp, xFrac);
+    } else {
+      // Lower surface vertex: TE→LE, map so xFrac goes 1 (TE) → 0 (LE).
+      const idx = j - N_SURFACE; // 0..N_SURFACE-2
+      const xFrac = 1 - idx / (N_SURFACE - 1);
+      out[j] = interpolateFromArray(lowerX, lowerCp, xFrac);
+    }
+  }
+}
+
+function interpolateFromArray(xArr, yArr, x) {
+  if (x <= xArr[0]) return yArr[0];
+  if (x >= xArr[xArr.length - 1]) return yArr[yArr.length - 1];
+  let lo = 0, hi = xArr.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (xArr[mid] <= x) lo = mid;
+    else hi = mid;
+  }
+  const f = (x - xArr[lo]) / (xArr[hi] - xArr[lo]);
+  return yArr[lo] + f * (yArr[hi] - yArr[lo]);
+}
+
+/**
+ * Build per-vertex velocity / dynamic-pressure / vorticity values by
+ * sampling the LBM field at each outline vertex.
+ */
+function buildLbmHeatValues(out, geo, S, mode) {
+  const nPts = geo.polyCount;
+  const half = NX * NY;
+  for (let j = 0; j < nPts; j++) {
+    const px = geo.poly[2 * j];
+    const py = geo.poly[2 * j + 1];
+    // Sample 3 cells away from the surface along the outward direction
+    // to avoid the no-slip boundary layer where velocity is near zero.
+    const cx = Math.round(px);
+    const cy = Math.round(py);
+    let ix = cx, iy = cy;
+    // Search outward for a non-solid cell (up to 5 cells).
+    for (let d = 1; d <= 5; d++) {
+      let found = false;
+      for (let dy = -d; dy <= d && !found; dy++) {
+        for (let dx = -d; dx <= d && !found; dx++) {
+          const tx = cx + dx, ty = cy + dy;
+          if (tx < 0 || tx >= NX || ty < 0 || ty >= NY) continue;
+          const tid = ty * NX + tx;
+          if (!S.solid[tid]) { ix = tx; iy = ty; found = true; }
+        }
+      }
+      if (found) break;
+    }
+    const id = iy * NX + ix;
+    if (id >= 0 && id < half && !S.solid[id]) {
+      const u = S.ux[id];
+      const v = S.uy[id];
+      const speed = Math.sqrt(u * u + v * v);
+      if (mode === HEATMAP_VELOCITY) {
+        out[j] = speed / U_LAT;
+      } else if (mode === HEATMAP_DYNAMIC_PRESSURE) {
+        out[j] = 0.5 * 1.225 * speed * speed;
+      } else if (mode === HEATMAP_VORTICITY) {
+        out[j] = computeVorticityAt(S, ix, iy);
+      } else {
+        out[j] = speed / U_LAT;
+      }
+    } else {
+      out[j] = 0;
+    }
+  }
+}
+
+/**
+ * Estimate vorticity at a lattice cell using central differences.
+ */
+function computeVorticityAt(S, x, y) {
+  if (x < 1 || x >= NX - 1 || y < 1 || y >= NY - 1) return 0;
+  const dvdx = (S.uy[(y) * NX + (x + 1)] - S.uy[(y) * NX + (x - 1)]) * 0.5;
+  const dudy = (S.ux[(y + 1) * NX + (x)] - S.ux[(y - 1) * NX + (x)]) * 0.5;
+  return dvdx - dudy;
+}
+
+/**
+ * Draw a semi-transparent wake volume behind the geometry.
+ */
+
+
 /**
  * Draw the extruded wing and the tracers into the 3D viewport.
  * `St.sz` gives each tracer its spanwise station; everything else comes from
  * the same state the 2D view renders.
  */
-function render3D(ctx, S, geo, St, cam, spanCells) {
+function render3D(ctx, S, geo, St, cam, spanCells, opts = {}) {
+  const {
+    heatmapMode: hmMode = HEATMAP_NONE,
+    colorScale: hmScale = COLOR_SCALE_JET,
+    panelSolution: hmPanel = null,
+  } = opts;
+
   ctx.fillStyle = '#0a101e';
   ctx.fillRect(0, 0, VIEW3D_W, VIEW3D_H);
   if (!geo) return;
@@ -1435,67 +1819,112 @@ function render3D(ctx, S, geo, St, cam, spanCells) {
   ORDER.length = 0;
 
   // --- Wing: one quad per outline edge, spanning the full wing -------------
-  // The section is constant along span, so no spanwise subdivision is needed.
   WING_N = 0;
   for (let i = 0; i < geo.polyCount && WING_N < WING_CAP; i += WING_OUTLINE_STEP) {
     WING_IDX[WING_N++] = i;
   }
 
-  // Light from above and slightly front-left, in world axes. Extruded side
-  // faces have no z-component to their normal, so only LX/LY matter for them.
+  // Light direction used for shading (only when heat map is off).
   const LX = -0.35;
   const LY = 0.82;
 
-  for (let k = 0; k < WING_N; k++) {
-    const i = WING_IDX[k];
-    const ax = geo.poly[2 * i];
-    const ay = geo.poly[2 * i + 1];
-    const okN = project(P3, ax, ay, -hz);
-    NEAR_X[k] = PRJ[0];
-    NEAR_Y[k] = PRJ[1];
-    NEAR_D[k] = PRJ[2];
-    const okF = project(P3, ax, ay, hz);
-    FAR_X[k] = PRJ[0];
-    FAR_Y[k] = PRJ[1];
-    FAR_D[k] = PRJ[2];
-    WING_OK[k] = okN && okF ? 1 : 0;
+  // Pre-compute per-vertex heat map values if a heat map mode is active.
+  let heatVal = null;
+  if (hmMode !== HEATMAP_NONE) {
+    heatVal = new Float64Array(geo.polyCount);
+    if (hmMode === HEATMAP_CP && hmPanel) {
+      buildCpHeatValues(heatVal, geo, hmPanel);
+    } else {
+      buildLbmHeatValues(heatVal, geo, S, hmMode);
+    }
   }
 
-  for (let k = 0; k < WING_N; k++) {
-    const k2 = (k + 1) % WING_N;
-    if (!WING_OK[k] || !WING_OK[k2]) continue;
-    const i = WING_IDX[k];
-    const j = WING_IDX[k2];
-    const ex = geo.poly[2 * j] - geo.poly[2 * i];
-    const ey = geo.poly[2 * j + 1] - geo.poly[2 * i + 1];
-    const el = Math.hypot(ex, ey) || 1;
-    // The poly winds upper LE->TE then lower TE->LE, for which (-dy, dx)
-    // points out of the section everywhere.
-    const diffuse = Math.max(0, (-ey / el) * LX + (ex / el) * LY);
-    WING_SHADE[k] = 0.22 + 0.78 * diffuse;
-    pushDraw(
-      (NEAR_D[k] + NEAR_D[k2] + FAR_D[k] + FAR_D[k2]) * 0.25,
-      0,
-      k,
-      WING_SHADE[k]
-    );
+  // Build quads with either heat map or diffuse-lighting colouring.
+  // Clamp Cp to a physically meaningful range for subsonic flow.
+  let heatMin = Infinity, heatMax = -Infinity;
+  if (heatVal) {
+    const useClamp = hmMode === HEATMAP_CP;
+    const clampLo = -2.0, clampHi = 1.1;
+    for (let k = 0; k < WING_N; k++) {
+      const i = WING_IDX[k];
+      let v = heatVal[i];
+      if (useClamp) v = Math.max(clampLo, Math.min(clampHi, v));
+      if (v < heatMin) heatMin = v;
+      if (v > heatMax) heatMax = v;
+    }
+    if (heatMax - heatMin < 1e-10) { heatMax = heatMin + 1; }
   }
 
-  // End caps, so the wing reads as solid when seen from the side.
-  let capNearD = 0;
-  let capFarD = 0;
-  for (let k = 0; k < WING_N; k++) {
-    capNearD += NEAR_D[k];
-    capFarD += FAR_D[k];
+  const projectSlice = (z, outX, outY, outD, outOk) => {
+    for (let k = 0; k < WING_N; k++) {
+      const i = WING_IDX[k];
+      const ax = geo.poly[2 * i], ay = geo.poly[2 * i + 1];
+      outOk[k] = project(P3, ax, ay, z) ? 1 : 0;
+      outX[k] = PRJ[0]; outY[k] = PRJ[1]; outD[k] = PRJ[2];
+    }
+  };
+
+  const emitQuads = (nX, nY, nD, nOk, fX, fY, fD, fOk) => {
+    for (let k = 0; k < WING_N; k++) {
+      const k2 = (k + 1) % WING_N;
+      if (!nOk[k] || !nOk[k2] || !fOk[k] || !fOk[k2]) continue;
+      const i = WING_IDX[k];
+      const j = WING_IDX[k2];
+      const ex = geo.poly[2 * j] - geo.poly[2 * i];
+      const ey = geo.poly[2 * j + 1] - geo.poly[2 * i + 1];
+      const el = Math.hypot(ex, ey) || 1;
+      const diffuse = Math.max(0, (-ey / el) * LX + (ex / el) * LY);
+      const baseShade = 0.22 + 0.78 * diffuse;
+      let col;
+      if (heatVal) {
+        let va = heatVal[i], vb = heatVal[j];
+        if (hmMode === HEATMAP_CP) { va = Math.max(-2, Math.min(1.1, va)); vb = Math.max(-2, Math.min(1.1, vb)); }
+        const t = (va + vb) / 2;
+        const tn = (t - heatMin) / (heatMax - heatMin);
+        const c = heatColor(tn, hmScale);
+        const blend = 0.7 + 0.3 * baseShade;
+        col = `rgb(${(c.r * blend) | 0},${(c.g * blend) | 0},${(c.b * blend) | 0})`;
+        WING_HR[k] = (c.r * blend) | 0;
+        WING_HG[k] = (c.g * blend) | 0;
+        WING_HB[k] = (c.b * blend) | 0;
+        WING_SHADE[k] = baseShade;
+      } else {
+        col = null;
+        WING_SHADE[k] = baseShade;
+      }
+      pushDraw((nD[k] + nD[k2] + fD[k] + fD[k2]) * 0.25, 0, k, heatVal ? 0 : WING_SHADE[k], col);
+    }
+  };
+
+  // Single near/far extrusion.
+  projectSlice(-hz, NEAR_X, NEAR_Y, NEAR_D, WING_OK);
+  projectSlice(hz, FAR_X, FAR_Y, FAR_D, SLICE_OK);
+  emitQuads(NEAR_X, NEAR_Y, NEAR_D, WING_OK, FAR_X, FAR_Y, FAR_D, SLICE_OK);
+
+  // End caps.
+  let heatEndCapCol = '';
+  if (heatVal) {
+    let sumR = 0, sumG = 0, sumB = 0, count = 0;
+    for (let k = 0; k < WING_N; k++) {
+      if (WING_OK[k]) { sumR += WING_HR[k]; sumG += WING_HG[k]; sumB += WING_HB[k]; count++; }
+    }
+    if (count > 0) {
+      heatEndCapCol = `rgb(${(sumR / count) | 0},${(sumG / count) | 0},${(sumB / count) | 0})`;
+    }
   }
-  pushDraw(capNearD / WING_N, 2, 0, 0.55);
-  pushDraw(capFarD / WING_N, 2, 1, 0.55);
+  let capNearD = 0, capFarD = 0;
+  for (let k = 0; k < WING_N; k++) {
+    capNearD += NEAR_D[k]; capFarD += FAR_D[k];
+  }
+  pushDraw(capNearD / WING_N, 2, 0, heatVal ? 0 : 0.55);
+  pushDraw(capFarD / WING_N, 2, 1, heatVal ? 0 : 0.55);
 
   // --- Tracers ------------------------------------------------------------
   // Cull tracers whose head projects outside the viewport (with a margin for
   // the trail that follows it) before they reach the sort or the draw loop.
   const margin = 60;
-  for (let i = 0; i < STREAK_COUNT; i++) {
+  const nStr3 = St.activeCount;
+  for (let i = 0; i < nStr3; i++) {
     if (St.count[i] < 3) continue;
     const z = St.sz[i] * spanCells;
     if (!project(P3, St.x[i], St.y[i], z)) continue;
@@ -1517,15 +1946,11 @@ function render3D(ctx, S, geo, St, cam, spanCells) {
     const item = ORDER[n];
 
     if (item.kind === 0) {
-      // Extruded side face between outline points k and k+1.
       const k = item.index;
       const k2 = (k + 1) % WING_N;
       const sh = item.shade;
-      const col = `rgb(${(232 * sh) | 0},${(237 * sh) | 0},${(245 * sh) | 0})`;
+      const col = item.col || `rgb(${(232 * sh) | 0},${(237 * sh) | 0},${(245 * sh) | 0})`;
       ctx.fillStyle = col;
-      // Stroke with the fill colour too: adjacent quads are antialiased along
-      // their shared edge, which otherwise leaves a visible seam and makes the
-      // extruded surface look hatched.
       ctx.strokeStyle = col;
       ctx.lineWidth = 1;
       ctx.beginPath();
@@ -1540,10 +1965,15 @@ function render3D(ctx, S, geo, St, cam, spanCells) {
     }
 
     if (item.kind === 2) {
-      // End cap: the airfoil section itself at one end of the span.
       const useNear = item.index === 0;
       const sh = item.shade;
-      ctx.fillStyle = `rgb(${(232 * sh) | 0},${(237 * sh) | 0},${(245 * sh) | 0})`;
+      let col;
+      if (heatVal) {
+        col = heatEndCapCol;
+      } else {
+        col = `rgb(${(232 * sh) | 0},${(237 * sh) | 0},${(245 * sh) | 0})`;
+      }
+      ctx.fillStyle = col;
       ctx.beginPath();
       let moved = false;
       for (let k = 0; k < WING_N; k++) {
@@ -1643,6 +2073,7 @@ function render3D(ctx, S, geo, St, cam, spanCells) {
       }
     }
   }
+
 }
 
 /* ============================================================================
@@ -1662,7 +2093,12 @@ export default function WindTunnel({
   const [chordCm, setChordCm] = useState(initialChordCm);
   const [spanRatio, setSpanRatio] = useState(SPAN_DEFAULT);
   const [showInfo, setShowInfo] = useState(false);
-  const [activeTab, setActiveTab] = useState('2d'); // '2d' | '3d' — which viewport is shown
+  const [activeTab, setActiveTab] = useState('2d');
+  const [moleculeCount, setMoleculeCount] = useState(STREAK_DEFAULT);
+  const [geoType, setGeoType] = useState(GEO_NACA);
+  const [heatmapMode, setHeatmapMode] = useState(HEATMAP_NONE);
+  const [colorScale, setColorScale] = useState(COLOR_SCALE_JET);
+  const [showHeatmapInfo, setShowHeatmapInfo] = useState(false);
 
   const parsed = useMemo(() => parseNacaCode(code), [code]);
   const params = useMemo(
@@ -1670,42 +2106,38 @@ export default function WindTunnel({
     [airspeed, chordCm]
   );
 
-  // Last valid spec — the sim keeps running the previous airfoil while the user
-  // is mid-typing an incomplete code.
+  // For NACA geometry, parse the code. For other types, create a spec-like
+  // object that's compatible with the existing machinery.
   const [spec, setSpec] = useState(() => {
     const p = parseNacaCode(initialNacaCode);
     return p.ok ? p : parseNacaCode('2412');
   });
   useEffect(() => {
-    if (parsed.ok) setSpec(parsed);
-  }, [parsed]);
+    if (geoType === GEO_NACA) {
+      if (parsed.ok) setSpec(parsed);
+    } else {
+      // Non-NACA geometries don't use the NACA spec; set a dummy symmetric
+      // thin section so thickness/camber calls don't break.
+      setSpec({ ok: true, key: '0000', series: 4, label: GEOMETRY_LABELS[geoType], m: 0, p: 0, t: 0.01, symmetric: true });
+    }
+  }, [parsed, geoType]);
 
   // Section aerodynamics: evaluated at the true Reynolds number, independent of
   // the solver's internal Re_sim.
   const stallModel = useMemo(
-    () => computeStallModel(spec, params.reDisplay),
-    [spec, params.reDisplay]
+    () => (geoType === GEO_NACA || geoType === GEO_CLARKY
+      ? computeStallModel(spec, params.reDisplay)
+      : { clMax: 1e6, criticalAoa: 90, zeroLiftAoa: 0, clDesign: 0, liftSlope: 0.1 }),
+    [spec, params.reDisplay, geoType]
   );
 
-  /* --- Engines 1 and 3: steady section aerodynamics -----------------------
-   * Three memos, split by what each actually depends on, because the costs are
-   * wildly different. The panel system is a full LU factorisation (~10 ms) but
-   * depends only on the shape, so it is rebuilt only when the airfoil changes.
-   * Everything downstream is a back-substitution and a boundary-layer march —
-   * about 0.1 ms — so angle of attack, airspeed and size stay interactive. */
+  /* --- Engines 1 and 3: steady section aerodynamics ----------------------- */
 
   const panels = useMemo(() => {
-    // Unit chord, unrotated: incidence enters through the freestream direction,
-    // which is what keeps the factorisation reusable across angles.
-    const surfacePoint = (x, side) => {
-      const yt = thickness(x, spec.t);
-      const [yc, dyc] = camber(x, spec);
-      const th = Math.atan(dyc);
-      return [x - side * yt * Math.sin(th), yc + side * yt * Math.cos(th)];
-    };
+    const surfacePoint = makeSurfacePointCb(geoType, spec);
     const { X, Y } = buildPanelNodes(surfacePoint);
     return buildPanelSystem(X, Y);
-  }, [spec]);
+  }, [spec, geoType]);
 
   const panelSolution = useMemo(
     () => (panels ? solvePanels(panels, aoa) : null),
@@ -1812,14 +2244,21 @@ export default function WindTunnel({
   spanRatioRef.current = spanRatio;
   const activeTabRef = useRef(activeTab);
   activeTabRef.current = activeTab;
+  const heatmapModeRef = useRef(heatmapMode);
+  heatmapModeRef.current = heatmapMode;
+  const colorScaleRef = useRef(colorScale);
+  colorScaleRef.current = colorScale;
+  const panelSolutionRef = useRef(panelSolution);
+  panelSolutionRef.current = panelSolution;
   if (solverRef.current === null) solverRef.current = createSolver();
-  if (streaksRef.current === null) streaksRef.current = createStreaks();
+  if (streaksRef.current === null) streaksRef.current = createStreaks(moleculeCount);
   if (camRef.current === null) camRef.current = createCamera();
 
-  // --- Geometry: rebuild + full field reset on airfoil, AoA or size change ---
+  // --- Geometry: rebuild + full field reset on geoType, AoA or size change ---
   useEffect(() => {
-    const surfaces = buildSurfaces(spec);
+    const surfaces = buildGeometry(geoType, spec);
     const geo = placeAirfoil(surfaces, aoa, nCellsFor(cmToM(chordCm)));
+    geo.geoType = geoType;
     const { solid, nearSolid } = rasterize(geo);
 
     const S = solverRef.current;
@@ -1828,10 +2267,8 @@ export default function WindTunnel({
     geoRef.current = geo;
     resetPendingRef.current = true;
     warmupRef.current = WARMUP_FRAMES;
-    // Tracers must be reseeded: some will now be inside the new solid, and any
-    // surviving trail would be a streak drawn through the old airfoil.
     streaksRef.current.seeded = false;
-  }, [spec, aoa, chordCm]);
+  }, [geoType, spec, aoa, chordCm]);
 
   // --- Airspeed: retune tau / dt only; the flow adapts continuously ---------
   useEffect(() => {
@@ -1840,6 +2277,20 @@ export default function WindTunnel({
     solverRef.current.omegaPlus = params.omegaPlus;
     solverRef.current.omegaMinus = params.omegaMinus;
   }, [params, airspeed]);
+
+  // --- Molecule count: spawn or retire tracers -------------------------------
+  const prevMoleculeCount = useRef(moleculeCount);
+  useEffect(() => {
+    const St = streaksRef.current;
+    const S = solverRef.current;
+    if (!St || !S) return;
+    const old = prevMoleculeCount.current;
+    St.activeCount = moleculeCount;
+    if (moleculeCount > old) {
+      for (let i = old; i < moleculeCount; i++) spawnStreak(St, i, S, true);
+    }
+    prevMoleculeCount.current = moleculeCount;
+  }, [moleculeCount]);
 
   // --- Simulation + render loop --------------------------------------------
   useEffect(() => {
@@ -1894,7 +2345,7 @@ export default function WindTunnel({
       computeMacroscopic(S);
       if (!St.seeded) resetStreaks(St, S);
       advanceStreaks(St, S, airspeedRef.current, dt);
-      renderFrame(ctx, field, fieldCtx, fieldImage, S, geoRef.current, St);
+      renderFrame(ctx, field, fieldCtx, fieldImage, S, geoRef.current, St, {});
 
       if (ctx3d && geoRef.current && activeTabRef.current === '3d') {
         render3D(
@@ -1903,7 +2354,12 @@ export default function WindTunnel({
           geoRef.current,
           St,
           camRef.current,
-          spanRatioRef.current * geoRef.current.nCells
+          spanRatioRef.current * geoRef.current.nCells,
+          {
+            heatmapMode: heatmapModeRef.current,
+            colorScale: colorScaleRef.current,
+            panelSolution: panelSolutionRef.current,
+          }
         );
       }
 
@@ -2030,19 +2486,34 @@ export default function WindTunnel({
 
       <div className={styles.topBar}>
         <div className={styles.control}>
-          <label className={styles.label} htmlFor="wt-naca">
-            NACA airfoil
+          <label className={styles.label} htmlFor="wt-geometry">
+            Geometry
+          </label>
+          <select
+            id="wt-geometry"
+            className={styles.select}
+            value={geoType}
+            onChange={(e) => setGeoType(e.target.value)}
+          >
+            {Object.entries(GEOMETRY_LABELS).map(([k, v]) => (
+              <option key={k} value={k}>{v}</option>
+            ))}
+          </select>
+        </div>
 
+        <div className={`${styles.control} ${geoType !== GEO_NACA ? styles.controlHidden : ''}`}>
+          <label className={styles.label} htmlFor="wt-naca">
+            NACA code
           </label>
           <input
             id="wt-naca"
-            className={`${styles.textInput} ${parsed.ok ? '' : styles.textInputError}`}
+            className={`${styles.textInput} ${!parsed.ok && geoType === GEO_NACA ? styles.textInputError : ''}`}
             value={code}
             onChange={onCodeChange}
             spellCheck={false}
             autoComplete="off"
             placeholder="2412"
-            aria-invalid={!parsed.ok}
+            aria-invalid={!parsed.ok && geoType === GEO_NACA}
           />
         </div>
 
@@ -2112,10 +2583,126 @@ export default function WindTunnel({
             onChange={(e) => setSpanRatio(Number(e.target.value))}
           />
         </div>
+
+        <div className={styles.control}>
+          <label className={styles.label} htmlFor="wt-molecules">
+            Molecules{' '}
+            <span className={styles.labelValue}>{moleculeCount}</span>
+          </label>
+          <input
+            id="wt-molecules"
+            className={styles.slider}
+            type="range"
+            min={50}
+            max={STREAK_MAX}
+            step={50}
+            value={moleculeCount}
+            onChange={(e) => setMoleculeCount(Number(e.target.value))}
+          />
+        </div>
       </div>
 
-      {!parsed.ok && <div className={styles.error}>{parsed.error}</div>}
-      {parsed.ok && parsed.warning && <div className={styles.warning}>{parsed.warning}</div>}
+      {/* --- Visualisation toggles (collapsible bar) ------------------------- */}
+      <div className={styles.toggleBar}>
+      </div>
+
+      {activeTab === '3d' && (
+        <>
+          <div className={styles.topBar}>
+            <div className={styles.control}>
+              <label className={styles.label} htmlFor="wt-heatmap">Heat map</label>
+              <select
+                id="wt-heatmap"
+                className={styles.selectSmall}
+                value={heatmapMode}
+                onChange={(e) => setHeatmapMode(e.target.value)}
+              >
+                {Object.entries(HEATMAP_LABELS).map(([k, v]) => (
+                  <option key={k} value={k}>{v}</option>
+                ))}
+              </select>
+            </div>
+
+            {heatmapMode !== HEATMAP_NONE && (
+              <div className={styles.control}>
+                <label className={styles.label} htmlFor="wt-colorscale">Scale</label>
+                <select
+                  id="wt-colorscale"
+                  className={styles.selectSmall}
+                  value={colorScale}
+                  onChange={(e) => setColorScale(e.target.value)}
+                >
+                  {Object.entries(COLOR_SCALE_LABELS).map(([k, v]) => (
+                    <option key={k} value={k}>{v}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            <button
+              type="button"
+              className={styles.heatmapInfoIcon}
+              onClick={() => setShowHeatmapInfo((v) => !v)}
+              aria-label="Heat map term definitions"
+              title="What do these terms mean?"
+            >
+              <span className={styles.circleI}>i</span>
+            </button>
+          </div>
+
+          {showHeatmapInfo && (
+            <div className={styles.heatmapInfo}>
+              <div className={styles.heatmapInfoHeader}>
+                Heat Map Terms
+                <button type="button" className={styles.heatmapInfoClose} onClick={() => setShowHeatmapInfo(false)}>✕</button>
+              </div>
+              <dl className={styles.heatmapInfoBody}>
+                <dt>Pressure C<sub>p</sub></dt>
+                <dd>
+                  Pressure coefficient: <em>C<sub>p</sub> = (p − p<sub>∞</sub>) / q<sub>∞</sub></em>.
+                  Negative values (suction) appear in blue; positive values (higher pressure) in red.
+                  Large pressure differences between upper and lower surfaces generate lift.
+                </dd>
+                <dt>Velocity</dt>
+                <dd>
+                  Local flow speed normalised by the freestream. Values above 1 indicate
+                  acceleration (e.g. over the leading edge), values below 1 indicate deceleration
+                  (e.g. in the wake or boundary layer). Derived from the LBM velocity field.
+                </dd>
+                <dt>Dynamic Pressure</dt>
+                <dd>
+                  <em>q = ½ ρ v²</em>, the kinetic energy per unit volume of the flow. High
+                  dynamic pressure coincides with high-velocity regions; low values mark
+                  separated or stagnant flow. Computed from the LBM velocity with ρ = 1.225 kg/m³.
+                </dd>
+                <dt>Vorticity</dt>
+                <dd>
+                  <em>ω = ∂v/∂x − ∂u/∂y</em>, a measure of local rotation in the flow.
+                  High vorticity marks shear layers, the wake, and boundary-layer activity.
+                  Estimated by central differences on the LBM velocity field.
+                </dd>
+                <dt>Jet (colour scale)</dt>
+                <dd>
+                  Blue → cyan → green → yellow → red, from low to high values. The
+                  standard multi-purpose CFD colour map.
+                </dd>
+                <dt>Hot (colour scale)</dt>
+                <dd>
+                  Black → red → orange → yellow → white, from low to high values.
+                  Emphasises high-value regions with bright warm colours.
+                </dd>
+              </dl>
+              <p className={styles.heatmapInfoNote}>
+                Heat map values are sampled from the LBM field or the panel-method solution and
+                interpolated onto the 3D wing surface. They update every frame.
+              </p>
+            </div>
+          )}
+        </>
+      )}
+
+      {geoType === GEO_NACA && !parsed.ok && <div className={styles.error}>{parsed.error}</div>}
+      {geoType === GEO_NACA && parsed.ok && parsed.warning && <div className={styles.warning}>{parsed.warning}</div>}
 
       <div className={`${styles.body} ${activeTab === '2d' ? '' : styles.tabHidden}`}>
         <div className={styles.viewport}>
@@ -2132,7 +2719,7 @@ export default function WindTunnel({
               aria-expanded={showInfo}
             >
               Live LBM visualisation (Re_sim ≈ {params.reSimEffective.toFixed(0)}) · dashboard
-              uses the exact true Re = {formatSci(params.reDisplay)} ⓘ
+              uses the exact true Re = {formatSci(params.reDisplay)} (i)
             </button>
           </div>
 
