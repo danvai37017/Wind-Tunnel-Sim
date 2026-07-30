@@ -1,11 +1,23 @@
 /**
  * WindTunnel — interactive 2D wind tunnel.
  *
- * Flow field is a live PDE solve: D2Q9 Lattice-Boltzmann (TRT collision), which
- * recovers the 2D incompressible Navier-Stokes equations in the low-Mach limit.
- * Airfoil geometry is generated from the NACA 4- and 5-digit series equations.
- * Stall angle comes from section aerodynamics evaluated at the true Reynolds
- * number, not from the (much lower Reynolds) flow fiel d -- see section 4.
+ * Three engines run side by side, each doing the job it is actually good at:
+ *
+ *   1. Force calculator — Hess-Smith vortex panel method (aero.js). Solves the
+ *      steady potential flow for circulation, C_L and the surface C_p
+ *      distribution. Drag follows from Hoerner's empirical bulge formula.
+ *   2. Visualiser — D2Q9 Lattice-Boltzmann (TRT collision), which recovers the
+ *      2D incompressible Navier-Stokes equations in the low-Mach limit. It
+ *      drives the streak animation and nothing else; a browser-scale solve runs
+ *      at Re of order 1e3, far below anything a real wing sees.
+ *   3. Separator — boundary-layer integral method (aero.js): Thwaites laminar,
+ *      Head turbulent, giving the chordwise detachment point x/c.
+ *
+ * Engines 1 and 3 are steady, exact for their model, and cost about 0.1 ms
+ * together, so the dashboard tracks the sliders instantly and is evaluated at
+ * the *true* Reynolds number. Engine 2 animates independently at whatever rate
+ * the frame budget allows. Airfoil geometry is generated from the NACA 4- and
+ * 5-digit series equations and shared by all three.
  *
  * Self-contained: no required props, no external state, no context. Drop in as
  * <WindTunnel /> and it works.
@@ -13,6 +25,13 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import styles from './WindTunnel.module.css';
+import {
+  buildPanelNodes,
+  buildPanelSystem,
+  solvePanels,
+  separationPoint,
+  hoernerDrag,
+} from './aero.js';
 
 /* ============================================================================
  * 1. Physical constants & domain configuration
@@ -55,16 +74,6 @@ const STREAK_3D_TAIL_W = 0.75;
 const SPHERE_MAX_PX = 4.5;
 // Same guard for the ribbon: cap its half-width in pixels.
 const RIBBON_MAX_HALF_PX = 3.5;
-
-// Lift is averaged over a rolling window of rendered frames before it is shown
-// or turned into a coefficient. Separated flow sheds vortices, so the raw force
-// genuinely oscillates. Measured spread of the reported C_L, NACA 2412 at 6 cm
-// and 30 m/s: 10 frames +/-14% (54% peak-to-peak), 30 frames +/-11%, 60 frames
-// +/-5% (21% peak-to-peak). Past 60 the returns are erratic rather than better,
-// because the noise is quasi-periodic shedding and a longer window can alias
-// it. 60 frames is one second at 60 fps -- smooth enough to read, quick enough
-// to respond to a slider.
-const FORCE_AVG_FRAMES = 60;
 
 // "Near stall" threshold: the fraction of the section lift-curve slope below
 // which the wing is warned about. Stall itself is slope <= 0.
@@ -165,19 +174,6 @@ const WARMUP_FRAMES = 150;
 // near 7 substeps; the cap is set above that to let the warm-up boost bite.
 // The adaptive controller scales this down automatically on slower machines.
 const MAX_SUBSTEPS = 12;
-const READOUT_INTERVAL_MS = 80; // ~12.5 Hz panel refresh
-
-// Separation survey: chordwise stations scanned along the suction surface to
-// locate the separation point (replacing the old 4-point yes/no vote).
-const SEP_STATION_MIN = 0.06;
-const SEP_STATION_MAX = 0.98;
-const SEP_STATIONS = 48;
-// Stations inspected ahead of a candidate point to confirm the reversed region
-// is sustained rather than a single vortex passing by.
-const SEP_RUN = 6;
-// Separated flow is genuinely unsteady, so the reported separation point is
-// time-averaged rather than read off a single frame.
-const SEP_EMA_ALPHA = 0.08;
 
 // Thin-airfoil lift-curve slope, 2*pi per radian, expressed per degree (0.1097).
 const A0_PER_DEG = 2 * Math.PI * (Math.PI / 180);
@@ -721,9 +717,6 @@ function computeParams(vInf, chord) {
   const tauMinus = 0.5 + TRT_LAMBDA / (tau - 0.5);
 
   const dx = DX; // m per cell (fixed: the tunnel is a fixed physical box)
-  const dt = (U_LAT * dx) / vInf; // s per timestep
-  const dm = RHO_AIR * dx * dx; // kg per unit span
-  const dF = (dm * dx) / (dt * dt); // N per lattice force unit
 
   // The cell count is rounded, so the chord the lattice actually represents is
   // a fraction of a percent off the requested one. Use that effective chord for
@@ -746,8 +739,6 @@ function computeParams(vInf, chord) {
     reSimRequested,
     reSimEffective,
     dx,
-    dt,
-    dF,
     reDisplay,
   };
 }
@@ -767,17 +758,6 @@ function createSolver() {
     spd: new Float32Array(NXNY),
     omegaPlus: 1 / 0.6,
     omegaMinus: 1 / 0.6,
-    fx: 0, // per-step lattice force
-    fy: 0,
-    fxSum: 0, // accumulated over the current frame's substeps
-    fySum: 0,
-    stepsThisFrame: 0,
-    fxRing: new Float64Array(FORCE_AVG_FRAMES), // per-frame means
-    fyRing: new Float64Array(FORCE_AVG_FRAMES),
-    ringHead: 0,
-    ringCount: 0,
-    fxAvg: 0, // rolling mean over the ring
-    fyAvg: 0,
     diverged: false,
   };
 }
@@ -792,17 +772,6 @@ function resetField(S) {
     f.fill(val, DIR_OFF[i], DIR_OFF[i] + NXNY);
   }
   S.fNew.set(f);
-  S.fx = 0;
-  S.fy = 0;
-  S.fxSum = 0;
-  S.fySum = 0;
-  S.stepsThisFrame = 0;
-  S.fxRing.fill(0);
-  S.fyRing.fill(0);
-  S.ringHead = 0;
-  S.ringCount = 0;
-  S.fxAvg = 0;
-  S.fyAvg = 0;
   S.diverged = false;
 }
 
@@ -860,10 +829,8 @@ function collideStreamGeneric(S, x, y) {
 
     const tid = ty * NX + tx;
     if (solid[tid]) {
-      // No-slip: full bounce-back, plus momentum exchange for the force tally.
+      // No-slip: full bounce-back.
       fNew[DIR_OFF[OPP[i]] + id] = FS[i];
-      S.fx += 2 * FS[i] * EX[i];
-      S.fy += 2 * FS[i] * EY[i];
     } else {
       fNew[DIR_OFF[i] + tid] = FS[i];
     }
@@ -873,9 +840,6 @@ function collideStreamGeneric(S, x, y) {
 /** One full LBM timestep: collide -> stream -> boundary conditions. */
 function lbmStep(S) {
   const { f, fNew, solid, nearSolid, omegaPlus, omegaMinus } = S;
-
-  S.fx = 0;
-  S.fy = 0;
 
   const O1 = DIR_OFF[1];
   const O2 = DIR_OFF[2];
@@ -1001,43 +965,6 @@ function lbmStep(S) {
       fc[base + row + NX - 1] = fc[base + row + NX - 2];
     }
   }
-
-  // Accumulate this step into the current frame's total; the frame mean is
-  // pushed into the rolling window once per rendered frame.
-  S.fxSum += S.fx;
-  S.fySum += S.fy;
-  S.stepsThisFrame++;
-}
-
-/**
- * Close out a rendered frame: push the frame's mean lattice force into the
- * rolling window and recompute the average over it.
- *
- * While the window is still filling (the first FORCE_AVG_FRAMES frames) the sum
- * is divided by however many samples exist, not by the full window size, so the
- * readout is correct from the very first frame instead of reading low.
- */
-function pushForceFrame(S) {
-  if (S.stepsThisFrame === 0) return;
-  const fx = S.fxSum / S.stepsThisFrame;
-  const fy = S.fySum / S.stepsThisFrame;
-  S.fxSum = 0;
-  S.fySum = 0;
-  S.stepsThisFrame = 0;
-
-  S.fxRing[S.ringHead] = fx;
-  S.fyRing[S.ringHead] = fy;
-  S.ringHead = (S.ringHead + 1) % FORCE_AVG_FRAMES;
-  if (S.ringCount < FORCE_AVG_FRAMES) S.ringCount++;
-
-  let sx = 0;
-  let sy = 0;
-  for (let i = 0; i < S.ringCount; i++) {
-    sx += S.fxRing[i];
-    sy += S.fyRing[i];
-  }
-  S.fxAvg = sx / S.ringCount;
-  S.fyAvg = sy / S.ringCount;
 }
 
 /** Read macroscopic u, v and speed off the distributions (4.6). */
@@ -1073,106 +1000,18 @@ function computeMacroscopic(S) {
 }
 
 /* ============================================================================
- * 8. Stall detection (7)
+ * 8. Separation
  * ==========================================================================*/
 
-/**
- * Locate the boundary-layer separation point on the suction surface.
- *
- * Surveys the surface from leading to trailing edge, sampling the tangential
- * velocity just outside the wall at each station. Separation is where the
- * tangential flow first reverses *and stays* reversed over the rest of the
- * chord -- requiring persistence is what rejects the isolated reversed cells
- * (shed vortices drifting past, laminar bubbles) that made a per-frame vote
- * flicker. Returns the chordwise position as a fraction of chord, or -1 when
- * the flow is attached.
- */
-function findSeparationPoint(S, geo, aoaDeg) {
-  if (!geo) return -1;
-  const surface = aoaDeg >= 0 ? geo.upper : geo.lower;
-  const sign = aoaDeg >= 0 ? 1 : -1; // outward normal handedness per surface
-  const { xs } = geo;
-
-  const reversedAt = new Uint8Array(SEP_STATIONS);
-  const stationX = new Float64Array(SEP_STATIONS);
-  let valid = 0;
-
-  for (let k = 0; k < SEP_STATIONS; k++) {
-    const station =
-      SEP_STATION_MIN + ((SEP_STATION_MAX - SEP_STATION_MIN) * k) / (SEP_STATIONS - 1);
-    stationX[k] = station;
-
-    // Nearest surface sample to this chordwise station.
-    let best = 1;
-    let bestErr = Infinity;
-    for (let j = 1; j < N_SURFACE - 1; j++) {
-      const err = Math.abs(xs[j] - station);
-      if (err < bestErr) {
-        bestErr = err;
-        best = j;
-      }
-    }
-
-    const sx = surface[2 * best];
-    const sy = surface[2 * best + 1];
-    let tx = surface[2 * (best + 1)] - surface[2 * (best - 1)];
-    let ty = surface[2 * (best + 1) + 1] - surface[2 * (best - 1) + 1];
-    const tl = Math.hypot(tx, ty);
-    if (tl < 1e-9) continue;
-    tx /= tl;
-    ty /= tl;
-
-    // Outward normal: (-ty, tx) on the upper surface, (ty, -tx) on the lower.
-    const nx = -ty * sign;
-    const ny = tx * sign;
-
-    // Step outward until clear of the solid mask.
-    let found = -1;
-    for (let d = 2.5; d <= 6.5; d += 1) {
-      const gx = Math.round(sx + nx * d);
-      const gy = Math.round(sy + ny * d);
-      if (gx < 1 || gx >= NX - 1 || gy < 1 || gy >= NY - 1) break;
-      const id = gy * NX + gx;
-      if (!S.solid[id]) {
-        found = id;
-        break;
-      }
-    }
-    if (found < 0) continue;
-
-    valid++;
-    if (S.ux[found] * tx + S.uy[found] * ty < 0) reversedAt[k] = 1;
-  }
-
-  if (valid < SEP_STATIONS * 0.5) return -1;
-
-  // Scan from the leading edge and take the start of the first *sustained*
-  // reversed region. Requiring a run (rather than a single station) rejects
-  // isolated reversed cells from passing vortices.
-  //
-  // Deliberately not anchored at the trailing edge: in deep stall the
-  // recirculation closes well before the TE, so a reversed region that must
-  // reach the TE would miss precisely the most separated cases.
-  let sepIndex = -1;
-  for (let k = 0; k < SEP_STATIONS; k++) {
-    if (!reversedAt[k]) continue;
-    let rev = 0;
-    let cnt = 0;
-    for (let j = k; j < Math.min(SEP_STATIONS, k + SEP_RUN); j++) {
-      cnt++;
-      rev += reversedAt[j];
-    }
-    if (cnt >= 3 && rev >= cnt * 0.75) {
-      sepIndex = k;
-      break;
-    }
-  }
-
-  // A reversed region confined to the last few percent of chord is ordinary
-  // trailing-edge thickening, not separation worth reporting.
-  if (sepIndex < 0 || stationX[sepIndex] > 0.95) return -1;
-  return stationX[sepIndex];
-}
+// Separation is Engine 3's job (separationPoint in aero.js), evaluated at the
+// true Reynolds number. It used to be surveyed off the live LBM field instead,
+// scanning the suction surface for sustained flow reversal. That was honest
+// about the flow it measured, but the flow it measured was the wrong one: the
+// solver runs near Re 1e3, where a real section separates many degrees early, so
+// the readout routinely showed detached flow on an airfoil still well below its
+// stall angle. It was also unsteady enough to need a 60-frame time average
+// before it would sit still. The integral method is steady, exact for its model,
+// and evaluated at the Reynolds number the wing actually flies at.
 
 /* ============================================================================
  * 9. Rendering (6.2)
@@ -1810,28 +1649,6 @@ function render3D(ctx, S, geo, St, cam, spanCells) {
  * 10. Component
  * ==========================================================================*/
 
-const READOUT_INIT = {
-  cl: 0,
-  cd: 0,
-  airspeed: 30,
-  reynolds: 0,
-  dragForce: 0,
-  liftForce: 0,
-  dynamicPressure: 0,
-  stallState: 'none',
-  stalling: false,
-  liftSlope: 0,
-  slopeFraction: 1,
-  chordCm: CHORD_DEFAULT_CM,
-  spanCm: CHORD_DEFAULT_CM * SPAN_DEFAULT,
-  spanRatio: SPAN_DEFAULT,
-  planformCm2: CHORD_DEFAULT_CM * CHORD_DEFAULT_CM * SPAN_DEFAULT,
-  criticalAoa: 0,
-  zeroLiftAoa: 0,
-  clMax: 0,
-  separationPoint: -1,
-};
-
 export default function WindTunnel({
   initialNacaCode = '2412',
   initialAirspeed = 30,
@@ -1844,11 +1661,6 @@ export default function WindTunnel({
   const [aoa, setAoa] = useState(initialAoa);
   const [chordCm, setChordCm] = useState(initialChordCm);
   const [spanRatio, setSpanRatio] = useState(SPAN_DEFAULT);
-  const [readings, setReadings] = useState({
-    ...READOUT_INIT,
-    airspeed: initialAirspeed,
-    chordCm: initialChordCm,
-  });
   const [showInfo, setShowInfo] = useState(false);
   const [activeTab, setActiveTab] = useState('2d'); // '2d' | '3d' — which viewport is shown
 
@@ -1875,24 +1687,123 @@ export default function WindTunnel({
     [spec, params.reDisplay]
   );
 
+  /* --- Engines 1 and 3: steady section aerodynamics -----------------------
+   * Three memos, split by what each actually depends on, because the costs are
+   * wildly different. The panel system is a full LU factorisation (~10 ms) but
+   * depends only on the shape, so it is rebuilt only when the airfoil changes.
+   * Everything downstream is a back-substitution and a boundary-layer march —
+   * about 0.1 ms — so angle of attack, airspeed and size stay interactive. */
+
+  const panels = useMemo(() => {
+    // Unit chord, unrotated: incidence enters through the freestream direction,
+    // which is what keeps the factorisation reusable across angles.
+    const surfacePoint = (x, side) => {
+      const yt = thickness(x, spec.t);
+      const [yc, dyc] = camber(x, spec);
+      const th = Math.atan(dyc);
+      return [x - side * yt * Math.sin(th), yc + side * yt * Math.cos(th)];
+    };
+    const { X, Y } = buildPanelNodes(surfacePoint);
+    return buildPanelSystem(X, Y);
+  }, [spec]);
+
+  const panelSolution = useMemo(
+    () => (panels ? solvePanels(panels, aoa) : null),
+    [panels, aoa]
+  );
+
+  // C_L at zero incidence sets where the drag bucket bottoms out: zero for a
+  // symmetric section, near the design C_L for a cambered one.
+  const clAtZeroAoa = useMemo(
+    () => (panels ? solvePanels(panels, 0).cl : 0),
+    [panels]
+  );
+
+  const separation = useMemo(
+    () =>
+      panels && panelSolution
+        ? separationPoint(panels, panelSolution, params.reDisplay)
+        : { x: -1, mode: 'attached', transitionX: -1 },
+    [panels, panelSolution, params.reDisplay]
+  );
+
+  /* --- The dashboard ------------------------------------------------------
+   * Every readout is now a pure function of the controls, so it is derived
+   * during render rather than sampled out of the animation loop. That is what
+   * makes the panel exact and instant: it updates on the same commit as the
+   * slider, not on the next throttled frame, and it no longer re-renders React
+   * 12 times a second to show numbers that have not changed. */
+  const readings = useMemo(() => {
+    const M = stallModel;
+    const curve = liftCurve(aoa, M);
+    const state = stallState(aoa, M);
+
+    const cl = panelSolution ? panelSolution.cl : 0;
+    const cd = hoernerDrag(cl, clAtZeroAoa, spec.t, params.reDisplay);
+
+    // The 2D section is extruded to the full span, so S = span * chord and the
+    // reported forces are whole-wing Newtons. C_L itself is span-invariant.
+    const span = spanRatio * params.chordEff;
+    const planform = span * params.chordEff;
+    const q = 0.5 * RHO_AIR * airspeed * airspeed;
+
+    return {
+      cl,
+      cd,
+      airspeed,
+      reynolds: params.reDisplay,
+      reSim: params.reSimEffective,
+      liftForce: cl * q * planform,
+      dragForce: cd * q * planform,
+      dynamicPressure: q,
+      stallState: state, // 'none' | 'near' | 'stall'
+      stalling: state === 'stall',
+      liftSlope: curve.slope, // dCl/dalpha, per degree
+      slopeFraction: curve.slopeFactor, // as a fraction of the section slope
+      chordCm: params.chord * 100,
+      spanCm: span * 100,
+      spanRatio,
+      planformCm2: planform * 1e4,
+      criticalAoa: M.criticalAoa,
+      zeroLiftAoa: M.zeroLiftAoa,
+      clMax: M.clMax,
+      separationPoint: separation.x,
+      separationMode: separation.mode, // 'attached' | 'laminar' | 'turbulent' | 'leading-edge'
+      transitionPoint: separation.transitionX,
+      // Engine 1 is inviscid, so past the critical angle it keeps integrating a
+      // potential flow the real wing has already lost. Flagged rather than
+      // clamped: the panel value is still the exact answer to the question the
+      // panel method asks, and the viscous stall model is shown right next to it.
+      clIsInviscid: state === 'stall',
+    };
+  }, [
+    stallModel,
+    aoa,
+    panelSolution,
+    clAtZeroAoa,
+    spec.t,
+    params,
+    airspeed,
+    spanRatio,
+    separation,
+  ]);
+
+  const readingsCbRef = useRef(onReadingsChange);
+  readingsCbRef.current = onReadingsChange;
+  useEffect(() => {
+    if (readingsCbRef.current) readingsCbRef.current(readings);
+  }, [readings]);
+
   const canvasRef = useRef(null);
   const solverRef = useRef(null);
   const geoRef = useRef(null);
   const paramsRef = useRef(computeParams(initialAirspeed, cmToM(initialChordCm)));
   const airspeedRef = useRef(initialAirspeed);
-  const aoaRef = useRef(initialAoa);
-  const stallModelRef = useRef(stallModel);
-  stallModelRef.current = stallModel;
   const resetPendingRef = useRef(true);
   const warmupRef = useRef(WARMUP_FRAMES);
   const substepsRef = useRef(2);
   // Smoothed per-frame cost of everything except the solver.
   const nonSolverEmaRef = useRef(12);
-  // Time-averaged separation point (fraction of chord); -1 means attached.
-  const sepRef = useRef(-1);
-  const stalledRef = useRef(false);
-  const readingsCbRef = useRef(onReadingsChange);
-  readingsCbRef.current = onReadingsChange;
 
   const streaksRef = useRef(null);
   const canvas3dRef = useRef(null);
@@ -1915,10 +1826,8 @@ export default function WindTunnel({
     S.solid = solid;
     S.nearSolid = nearSolid;
     geoRef.current = geo;
-    aoaRef.current = aoa;
     resetPendingRef.current = true;
     warmupRef.current = WARMUP_FRAMES;
-    sepRef.current = -1;
     // Tracers must be reseeded: some will now be inside the new solid, and any
     // surviving trail would be a streak drawn through the old airfoil.
     streaksRef.current.seeded = false;
@@ -1947,7 +1856,6 @@ export default function WindTunnel({
     const ctx3d = canvas3dRef.current ? canvas3dRef.current.getContext('2d') : null;
 
     let raf = 0;
-    let lastReadout = 0;
     let lastFrame = performance.now();
 
     const loop = (now) => {
@@ -1983,10 +1891,6 @@ export default function WindTunnel({
       for (let s = 0; s < n; s++) lbmStep(S);
       const solveMs = performance.now() - frameStart;
 
-      // One force sample per rendered frame, regardless of how many solver
-      // substeps ran, so the rolling window is a window of frames.
-      pushForceFrame(S);
-
       computeMacroscopic(S);
       if (!St.seeded) resetStreaks(St, S);
       advanceStreaks(St, S, airspeedRef.current, dt);
@@ -2003,69 +1907,9 @@ export default function WindTunnel({
         );
       }
 
-      // Panel readouts, throttled to a human-readable rate.
-      if (now - lastReadout >= READOUT_INTERVAL_MS) {
-        lastReadout = now;
-        const P = paramsRef.current;
-        const V = airspeedRef.current;
-
-        // Whole-wing forces: the 2D solve gives force per metre of span, so
-        // multiply by the span to get Newtons on the wing.
-        //   C_L = L / (0.5 * rho * V^2 * S),  S = span * chord
-        // C_L itself is span-invariant (both L and S scale with span); the
-        // slider moves the forces and the area, not the coefficient.
-        const span = spanRatioRef.current * P.chordEff;
-        const planform = span * P.chordEff;
-        const drag = S.fxAvg * P.dF * span;
-        const lift = S.fyAvg * P.dF * span;
-        const q = 0.5 * RHO_AIR * V * V;
-
-        // Stall straight off the lift curve: dCl/dalpha <= 0 is stall, and a
-        // slope below 20% of the section slope is the near-stall warning. The
-        // curve is evaluated at the true Reynolds number, not read off the
-        // low-Re flow field (which separates far too early, and unsteadily).
-        const M = stallModelRef.current;
-        const a = aoaRef.current;
-        const curve = liftCurve(a, M);
-        const state = stallState(a, M);
-        stalledRef.current = state === 'stall';
-
-        // The live solve still supplies where the boundary layer detaches,
-        // time-averaged so it reads as a physical quantity, not a flicker.
-        const sepNow = findSeparationPoint(S, geoRef.current, aoaRef.current);
-        const prevSep = sepRef.current;
-        if (sepNow < 0) {
-          sepRef.current = prevSep < 0 ? -1 : prevSep + (1.05 - prevSep) * SEP_EMA_ALPHA;
-          if (sepRef.current > 1) sepRef.current = -1; // relaxed back to attached
-        } else {
-          sepRef.current =
-            prevSep < 0 ? sepNow : prevSep + (sepNow - prevSep) * SEP_EMA_ALPHA;
-        }
-
-        const next = {
-          cl: lift / (q * planform),
-          cd: drag / (q * planform),
-          airspeed: V,
-          reynolds: P.reDisplay,
-          dragForce: drag,
-          liftForce: lift,
-          dynamicPressure: q,
-          stallState: state, // 'none' | 'near' | 'stall'
-          stalling: state === 'stall',
-          liftSlope: curve.slope, // dCl/dalpha, per degree
-          slopeFraction: curve.slopeFactor, // as a fraction of the section slope
-          chordCm: P.chord * 100,
-          spanCm: span * 100,
-          spanRatio: spanRatioRef.current,
-          planformCm2: planform * 1e4,
-          criticalAoa: M.criticalAoa,
-          zeroLiftAoa: M.zeroLiftAoa,
-          clMax: M.clMax,
-          separationPoint: sepRef.current,
-        };
-        setReadings(next);
-        if (readingsCbRef.current) readingsCbRef.current(next);
-      }
+      // No readout work here any more: the dashboard is derived from the
+      // controls during render (Engines 1 and 3), so this loop is purely the
+      // visualiser and never touches React state.
 
       // Everything after the solver — macroscopics, tracers, both canvases — is
       // fixed cost for the frame. Track it and give the solver the remainder.
@@ -2287,7 +2131,8 @@ export default function WindTunnel({
               onClick={() => setShowInfo((v) => !v)}
               aria-expanded={showInfo}
             >
-              Simulated at a numerically-stabilized Reynolds number ⓘ
+              Live LBM visualisation (Re_sim ≈ {params.reSimEffective.toFixed(0)}) · dashboard
+              uses the exact true Re = {formatSci(params.reDisplay)} ⓘ
             </button>
           </div>
 
@@ -2300,32 +2145,51 @@ export default function WindTunnel({
                 chord spanning {params.nCells} cells.
               </p>
               <p>
-                <strong>Stall angle</strong> comes from section aerodynamics evaluated at the true
-                Reynolds number, not from the flow field: the zero-lift angle (
-                {stallModel.zeroLiftAoa.toFixed(2)}°) is exact thin-airfoil theory integrated over
-                this airfoil's camber line, and Cl,max ({stallModel.clMax.toFixed(2)}) comes from an
-                empirical thickness/Reynolds correlation calibrated to published section data. That
-                puts the critical angle at <strong>{stallModel.criticalAoa.toFixed(1)}°</strong>.
+                That canvas is a <strong>visualiser only</strong>. Real air at flight-scale
+                Reynolds number cannot be resolved in real time in a browser, so the solver runs
+                at a separate, clamped <strong>Re_sim ≈ {params.reSimEffective.toFixed(0)}</strong>{' '}
+                (τ = {params.tau.toFixed(3)}), which keeps it stable and laminar/transitional. It
+                shows you the wake, the streamlines and where the flow comes off — none of the
+                numbers in the panel come from it.
               </p>
               <p>
-                The solver itself runs near Re {params.reSimEffective.toFixed(0)}, where a real
-                airfoil would separate several degrees earlier than it does at flight Reynolds
-                numbers. So the <em>separation point</em> readout (measured live from the solve) can
-                show detached flow while the airfoil is still below its true stall angle — that is
-                the low-Re flow being reported honestly, not a glitch.
+                Every <strong>dashboard readout</strong> is computed instead at the true Reynolds
+                number, V·c/ν ={' '}
+                {params.reDisplay.toLocaleString(undefined, { maximumFractionDigits: 0 })}, by two
+                steady solvers that run in about 0.1 ms:
               </p>
               <p>
-                The <strong>displayed Reynolds number</strong> (
-                {params.reDisplay.toLocaleString(undefined, { maximumFractionDigits: 0 })}) is the
-                true physical value, V·c/ν. Real air at flight-scale Re cannot be resolved in real
-                time in a browser — so the solver runs at a separate, clamped{' '}
-                <strong>Re_sim ≈ {params.reSimEffective.toFixed(0)}</strong> (τ ={' '}
-                {params.tau.toFixed(3)}), which keeps it stable and laminar/transitional.
+                <strong>C<sub>L</sub> and C<sub>p</sub></strong> come from a Hess–Smith vortex
+                panel method — {panels ? panels.n : 0} panels, a source sheet on each plus one
+                body vortex, closed by the Kutta condition at the trailing edge and solved exactly
+                by Gaussian elimination. It reproduces thin-airfoil theory (C<sub>L</sub> = 2πα) to
+                within 0.4% as the section is thinned, and resolves the thickness effect a thin-
+                airfoil result cannot: this section's slope is{' '}
+                {(A0_PER_DEG * (1 + 0.77 * spec.t) * (180 / Math.PI)).toFixed(2)} per radian rather
+                than 2π. Being inviscid it has no stall, so past the critical angle the
+                C<sub>L</sub> readout is marked <em>inviscid</em>. C<sub>D</sub> is Hoerner's
+                empirical bulge formula on top of Prandtl–Schlichting skin friction.
               </p>
               <p>
-                Expect the simulated stall angle and absolute force magnitudes to differ from
-                published high-Re wind-tunnel polars. The qualitative behaviour — lift build-up with
-                AoA, drag rise, separation and stall — is captured correctly.
+                <strong>The separation point</strong> comes from a boundary-layer integral method
+                marched along the suction surface: Thwaites' closed-form integral while laminar
+                (detaching at λ = −0.09, equivalently a shape factor of 3.55), handed over to
+                Head's entrainment method at Re<sub>θ</sub> = 200, which detaches as H₁ falls to
+                3.3. The edge velocity it integrates is the panel method's own C<sub>p</sub>.
+              </p>
+              <p>
+                <strong>Stall angle</strong> is section aerodynamics, also at the true Reynolds
+                number: the zero-lift angle ({stallModel.zeroLiftAoa.toFixed(2)}°) is exact
+                thin-airfoil theory integrated over this airfoil's camber line, and Cl,max (
+                {stallModel.clMax.toFixed(2)}) comes from an empirical thickness/Reynolds
+                correlation calibrated to published section data. That puts the critical angle at{' '}
+                <strong>{stallModel.criticalAoa.toFixed(1)}°</strong>.
+              </p>
+              <p>
+                All three are steady models, so expect the panel readouts to lose accuracy once
+                the flow genuinely separates (roughly α above 12°), and the absolute magnitudes to
+                differ from published high-Re wind-tunnel polars. For unsteady behaviour — vortex
+                shedding, wake flapping, reattachment — the LBM canvas is the honest picture.
               </p>
             </div>
           )}
@@ -2392,9 +2256,17 @@ function StallBanner({ state }) {
 
 /** Full readouts + stall chip, shared by the 2D and 3D side panels. */
 function LiveReadings({ readings }) {
+  const attached = readings.separationPoint < 0;
+  const deepStall = readings.separationMode === 'leading-edge';
+
   return (
     <>
-      <Readout label="Lift coefficient" symbol="Cl" value={readings.cl.toFixed(3)} unit="" />
+      <Readout
+        label="Lift coefficient"
+        symbol="Cl"
+        value={readings.cl.toFixed(3)}
+        unit={readings.clIsInviscid ? 'inviscid' : ''}
+      />
       <Readout label="Drag coefficient" symbol="Cd" value={readings.cd.toFixed(4)} unit="" />
       <Readout label="Airspeed" symbol="V∞" value={readings.airspeed.toFixed(0)} unit="m/s" />
       <Readout
@@ -2426,21 +2298,39 @@ function LiveReadings({ readings }) {
       <Readout
         label="Separation point"
         symbol="x/c"
-        // Anything past 0.95 chord is the trailing edge, which the detector
-        // itself declines to call separation; while the smoothed value is
-        // relaxing back through that region, report it as attached rather
-        // than showing a number that contradicts the state chip.
-        value={
-          readings.separationPoint < 0 || readings.separationPoint > 0.95
-            ? '—'
-            : readings.separationPoint.toFixed(2)
-        }
-        unit={
-          readings.separationPoint < 0 || readings.separationPoint > 0.95
-            ? 'attached'
-            : 'of chord'
-        }
+        // Three decimals, because the marching grid is 0.005 of chord: at two
+        // decimals a detachment at 0.015 renders as "0.01", which reads as
+        // sitting exactly on the leading-edge threshold when it is not.
+        value={attached ? '—' : readings.separationPoint.toFixed(3)}
+        unit={attached ? 'attached' : deepStall ? 'leading edge' : 'of chord'}
       />
+
+      <p className={styles.engineNote}>
+        C<sub>d</sub> and the critical angle come from a steady vortex-panel solve and an
+        empirical drag correlation — within about ±5% while the flow is attached (α below
+        12°). For unsteady wake dynamics, watch the live visualisation.
+      </p>
+
+      <p className={styles.engineNote}>
+        {deepStall ? (
+          <>
+            <strong>x/c = 0.00 — leading-edge separation.</strong> The flow is in deep stall:
+            it detaches at the nose and reattachment downstream is chaotic, which a boundary-
+            layer integral method cannot resolve. See the LBM canvas.
+          </>
+        ) : (
+          <>
+            x/c comes from steady boundary-layer integration (Thwaites laminar, Head
+            turbulent) — about ±3% of chord while α is below 12°.
+            {readings.transitionPoint >= 0 && (
+              <> Transition to turbulence at x/c ≈ {readings.transitionPoint.toFixed(2)}.</>
+            )}
+            {readings.separationMode !== 'attached' && (
+              <> Detachment here is {readings.separationMode}.</>
+            )}
+          </>
+        )}
+      </p>
 
       <div
         className={`${styles.stallChip} ${

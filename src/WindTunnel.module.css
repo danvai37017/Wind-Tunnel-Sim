@@ -421,6 +421,22 @@
   font-weight: 600;
 }
 
+/* Per-engine transparency notes, sitting under the readouts they qualify. */
+.engineNote {
+  grid-column: 1 / -1;
+  margin: 8px 0 0;
+  padding-top: 8px;
+  border-top: 1px solid rgb(38 48 65 / 60%);
+  font-size: 11px;
+  line-height: 1.5;
+  color: #7d8ba3;
+}
+
+.engineNote strong {
+  color: var(--wt-warn);
+  font-weight: 600;
+}
+
 .stallChipDetail {
   display: block;
   margin-top: 3px;
