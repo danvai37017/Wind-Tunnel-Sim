@@ -99,33 +99,43 @@ function bakeRamp(stops) {
 export const COLOR_SCALES = [
   {
     id: 'spectral',
-    label: 'Spectral (blue → red)',
+    label: 'Spectral (blue to red)',
     diverging: false,
     stops: ['#12246e', '#1c62c9', '#2ba7dd', '#35c46a', '#f2d13c', '#f0871d', '#d42a1f'],
+    describe:
+      'The familiar CFD blue to red rainbow. It is not perceptually uniform: lightness climbs to yellow and falls again to red, so equal steps in the data are not equal steps in brightness, and the eye tends to invent banding at the hue boundaries.',
   },
   {
     id: 'viridis',
-    label: 'Viridis (colour-blind safe)',
+    label: 'Viridis (safe for colour blindness)',
     diverging: false,
     stops: ['#440154', '#414487', '#2a788e', '#22a884', '#7ad151', '#fde725'],
+    describe:
+      'Monotonic in lightness (dark purple through teal and green to bright yellow), so equal steps in the data read as equal steps in brightness. Stays legible under every common colour vision deficiency, which makes it the honest default when a specific hue is not doing work.',
   },
   {
     id: 'coolwarm',
-    label: 'Cool → warm (diverging)',
+    label: 'Cool to warm (diverging)',
     diverging: true,
     stops: ['#3b4cc0', '#7b9ff9', '#c9d7f0', '#dcdcdc', '#f2c0a6', '#ed8064', '#b40426'],
+    describe:
+      'Blue at one pole, red at the other, with a neutral grey midpoint. As a diverging scale it pins that midpoint to zero, which is the encoding that actually matches the physics for the signed quantities (pressure coefficient and wall vorticity), where zero has a real meaning.',
   },
   {
     id: 'inferno',
     label: 'Inferno',
     diverging: false,
     stops: ['#000004', '#320a5a', '#781c6d', '#bb3654', '#ed6925', '#fbb61a', '#fcffa4'],
+    describe:
+      'A dark to bright ramp that runs near black through deep red and orange to cream. The low end recedes into the background while the bright peaks stay readable, which suits quantities whose interesting detail sits at the high end.',
   },
   {
     id: 'mono',
     label: 'Monochrome',
     diverging: false,
     stops: ['#0d1117', '#2b3a52', '#54708f', '#8ba3c4', '#e8edf5'],
+    describe:
+      'Pure greyscale, dark to light. Useful when the plot has to survive greyscale print, a photocopier, or any medium where colour is unavailable.',
   },
 ];
 
@@ -183,7 +193,7 @@ export const HEAT_MODES = [
     digits: 3,
     values: (state) => state.pressure.cp,
     describe:
-      'Surface pressure coefficient, integrated to give the lift and the moment. Warm is pressure above freestream static, cool is suction — the difference between the two surfaces is the lift.',
+      'Surface pressure coefficient, integrated to give the lift and the moment. Warm is pressure above freestream static, cool is suction; the difference between the two surfaces is the lift.',
   },
   {
     id: 'velocity',
@@ -201,8 +211,7 @@ export const HEAT_MODES = [
       return out;
     },
     describe:
-      'Edge velocity just outside the boundary layer, from the same panel solution the pressure comes from. It peaks where the pressure is lowest — the two are the same statement of Bernoulli.',
-  },
+      'Edge velocity just outside the boundary layer, from the same panel solution the pressure comes from. It peaks where the pressure is lowest; the two are the same statement of Bernoulli.',  },
   {
     id: 'q',
     label: 'Dynamic pressure',
@@ -223,7 +232,7 @@ export const HEAT_MODES = [
       return out;
     },
     describe:
-      'Local dynamic pressure ½ρV² at the boundary-layer edge — the pressure the flow would recover if it were brought to rest there.',
+      'Local dynamic pressure ½ρV² at the edge of the boundary layer, the pressure the flow would recover if it were brought to rest there.',
   },
   {
     id: 'vorticity',
@@ -252,7 +261,7 @@ export const HEAT_MODES = [
       return out;
     },
     describe:
-      'Vorticity at the wall, τ_wall/μ, from the boundary-layer wall shear. Sign follows the surface: the two sides of the section spin opposite ways, and the imbalance between them is the circulation that makes the lift.',
+      'Vorticity at the wall, τ_wall/μ, from the wall shear in the boundary layer. Sign follows the surface: the two sides of the section spin opposite ways, and the imbalance between them is the circulation that makes the lift.',
   },
 ];
 

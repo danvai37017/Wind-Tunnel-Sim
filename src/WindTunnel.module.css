@@ -612,6 +612,17 @@
   border: 1px solid var(--wt-border);
 }
 
+.heatLegendSymbol {
+  padding: 1px 7px;
+  border: 1px solid var(--wt-border);
+  border-radius: 4px;
+  background: rgb(255 255 255 / 0.05);
+  color: var(--wt-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
 /* ---- Heat map info icon and panel ---------------------------------------- */
 
 .heatmapInfoIcon {
@@ -681,6 +692,38 @@
   margin: 0;
 }
 
+.heatmapInfoSection {
+  margin: 2px 0 -2px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--wt-accent);
+}
+
+.heatmapInfoSection + dl {
+  margin-top: -4px;
+}
+
+.heatmapInfoBody dl {
+  margin: 0;
+}
+
+.heatmapInfoSymbol {
+  display: inline-block;
+  min-width: 26px;
+  padding: 0 7px;
+  margin-right: 8px;
+  border: 1px solid var(--wt-border);
+  border-radius: 4px;
+  background: rgb(255 255 255 / 0.05);
+  color: var(--wt-accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  text-align: center;
+  white-space: nowrap;
+}
+
 .heatmapInfoBody dt {
   font-weight: 600;
   color: var(--wt-text);
@@ -688,7 +731,7 @@
 }
 
 .heatmapInfoBody dd {
-  margin: 0 0 0 14px;
+  margin: 0 0 10px 14px;
   color: var(--wt-muted);
   line-height: 1.55;
 }

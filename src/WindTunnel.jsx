@@ -37,7 +37,6 @@ import {
   updateFlow,
   fillField,
   sampleFlow,
-  solverToView,
 } from './flow.js';
 import { parseNacaCode } from './solver/naca.js';
 import { GEOMETRIES, DEFAULT_GEOMETRY } from './solver/sections.js';
@@ -112,20 +111,6 @@ const GOLDEN = 0.6180339887; // low-discrepancy spawn spacing
 // section outline update on the same commit as the slider; the contour catches
 // up over the next few frames.
 const FIELD_BUDGET_MS = 4;
-
-/**
- * The optional flow-feature layers, in the order the toolbar lists them.
- * Streamlines are the tracer ribbons that were always there; the rest are new
- * views of the same converged state.
- */
-const LAYER_TOGGLES = [
-  ['streamlines', 'Streamlines'],
-  ['vectors', 'Velocity vectors'],
-  ['contours', 'Pressure contours'],
-  ['wake', 'Wake'],
-  ['stagnation', 'Stagnation point'],
-  ['separation', 'Separation'],
-];
 
 /* ============================================================================
  * 2. Colour
@@ -506,7 +491,6 @@ const WING_OK = new Uint8Array(WING_CAP);
 // gradient between them rather than one flat colour per panel.
 const WING_T0 = new Float64Array(WING_CAP);
 const WING_T1 = new Float64Array(WING_CAP);
-const WING_SEP = new Uint8Array(WING_CAP); // 1 where the boundary layer has separated
 
 // Per-outline-node heat value, averaged from the two panels meeting at it. The
 // solver's arrays are per panel; the mesh is drawn between nodes.
@@ -552,227 +536,6 @@ function drawDomainBox(ctx, P3, spanCells) {
     ctx.lineTo(pts[b][0], pts[b][1]);
   }
   ctx.stroke();
-}
-
-/* ---- Flow-feature layers -------------------------------------------------
- *
- * Everything below is drawn in the mid-span plane (z = 0). The solve is two-
- * dimensional and every spanwise station sees the identical flow, so drawing
- * these at every station would add no information and a great deal of clutter —
- * the mid-span plane is the section the 2D view already shows, placed in space.
- * ------------------------------------------------------------------------*/
-
-const VEC_STEP_CELLS = 22; // grid spacing for the velocity-vector field
-const VEC_LEN_CELLS = 13; // arrow length at freestream speed
-
-/** Velocity vectors on a coarse grid, coloured and scaled by local speed. */
-function drawVelocityVectors(ctx, F, P3) {
-  ctx.lineWidth = 1.2;
-  for (let y = VEC_STEP_CELLS; y < NY; y += VEC_STEP_CELLS) {
-    for (let x = VEC_STEP_CELLS; x < NX; x += VEC_STEP_CELLS) {
-      if (F.solid[(y | 0) * NX + (x | 0)]) continue;
-      sampleFlow(F, x, y, VEL);
-      const sp = Math.hypot(VEL[0], VEL[1]);
-      if (sp < 1e-4) continue;
-      const L = VEC_LEN_CELLS * Math.min(1.6, sp);
-      const x1 = x + (VEL[0] / sp) * L;
-      const y1 = y + (VEL[1] / sp) * L;
-
-      if (!project(P3, x, y, 0)) continue;
-      const ax = PRJ[0];
-      const ay = PRJ[1];
-      if (!project(P3, x1, y1, 0)) continue;
-      const bx = PRJ[0];
-      const by = PRJ[1];
-
-      ctx.strokeStyle = speedColor(sp);
-      ctx.beginPath();
-      ctx.moveTo(ax, ay);
-      ctx.lineTo(bx, by);
-      // Arrow head, built in screen space so it stays legible at any depth.
-      const dx = bx - ax;
-      const dy = by - ay;
-      const dl = Math.hypot(dx, dy) || 1;
-      const hx = (dx / dl) * 4;
-      const hy = (dy / dl) * 4;
-      ctx.moveTo(bx, by);
-      ctx.lineTo(bx - hx + hy * 0.55, by - hy - hx * 0.55);
-      ctx.moveTo(bx, by);
-      ctx.lineTo(bx - hx - hy * 0.55, by - hy + hx * 0.55);
-      ctx.stroke();
-    }
-  }
-}
-
-const CONTOUR_LEVELS = [-1.6, -1.1, -0.7, -0.4, -0.2, 0, 0.2, 0.45, 0.7];
-const CONTOUR_STEP = 4; // field cells between marching-squares samples
-
-/**
- * Pressure contours in the mid-span plane, by marching squares.
- *
- * Cp is not stored on the field grid, but for this incompressible potential
- * outer flow it is exactly 1 - |V|^2 with |V| normalised on the freestream —
- * the same Bernoulli relation the surface pressure comes from — so the contours
- * are of the same pressure field the forces were integrated from, not a
- * separate estimate of it.
- */
-function drawPressureContours(ctx, F, P3) {
-  if (!F.fieldReady) return;
-  const cpAt = (x, y) => {
-    if (F.solid[(y | 0) * NX + (x | 0)]) return NaN;
-    sampleFlow(F, x, y, VEL);
-    const s2 = VEL[0] * VEL[0] + VEL[1] * VEL[1];
-    return 1 - s2;
-  };
-
-  ctx.lineWidth = 1;
-  for (const level of CONTOUR_LEVELS) {
-    // Cool for suction, warm for pressure, mid grey at Cp = 0 — a diverging
-    // encoding, because Cp has a sign and a meaningful zero.
-    const t = Math.max(0, Math.min(1, (level + 1.6) / 2.3));
-    ctx.strokeStyle =
-      level === 0
-        ? 'rgba(200, 212, 230, 0.5)'
-        : `hsla(${(215 - 215 * t).toFixed(0)}, 78%, 62%, 0.42)`;
-    ctx.beginPath();
-    for (let y = 1; y < NY - CONTOUR_STEP; y += CONTOUR_STEP) {
-      for (let x = 1; x < NX - CONTOUR_STEP; x += CONTOUR_STEP) {
-        const a = cpAt(x, y);
-        const b = cpAt(x + CONTOUR_STEP, y);
-        const c = cpAt(x + CONTOUR_STEP, y + CONTOUR_STEP);
-        const d = cpAt(x, y + CONTOUR_STEP);
-        if (!(Number.isFinite(a) && Number.isFinite(b) && Number.isFinite(c) && Number.isFinite(d))) {
-          continue;
-        }
-        // Only the two dominant cases are drawn; the saddle cases are rare at
-        // this sampling and their omission costs a pixel of contour, not a
-        // wrong contour.
-        const seg = [];
-        const lerp = (x0, y0, v0, x1, y1, v1) => {
-          const f = (level - v0) / (v1 - v0 || 1);
-          return [x0 + (x1 - x0) * f, y0 + (y1 - y0) * f];
-        };
-        if (a > level !== b > level) seg.push(lerp(x, y, a, x + CONTOUR_STEP, y, b));
-        if (b > level !== c > level) {
-          seg.push(lerp(x + CONTOUR_STEP, y, b, x + CONTOUR_STEP, y + CONTOUR_STEP, c));
-        }
-        if (c > level !== d > level) {
-          seg.push(lerp(x + CONTOUR_STEP, y + CONTOUR_STEP, c, x, y + CONTOUR_STEP, d));
-        }
-        if (d > level !== a > level) seg.push(lerp(x, y + CONTOUR_STEP, d, x, y, a));
-        if (seg.length < 2) continue;
-        if (!project(P3, seg[0][0], seg[0][1], 0)) continue;
-        const sx = PRJ[0];
-        const sy = PRJ[1];
-        if (!project(P3, seg[1][0], seg[1][1], 0)) continue;
-        ctx.moveTo(sx, sy);
-        ctx.lineTo(PRJ[0], PRJ[1]);
-      }
-    }
-    ctx.stroke();
-  }
-}
-
-/**
- * The wake, as a translucent volume trailing the trailing edge.
- *
- * Its half-height is the boundary-layer displacement thickness carried into the
- * wake by the solver, so the shape is the computed wake and not a decorative
- * cone: a section with an attached boundary layer gets a thin ribbon, and one
- * that has separated gets the thick lobe its displacement thickness actually
- * grew into. Opacity falls downstream because the momentum deficit is being
- * diffused away, which is the same reason the real wake fades.
- */
-function drawWakeVolume(ctx, F, P3, spanCells) {
-  const st = F.state;
-  const wake = F.solver.sourceWake;
-  if (!st || !wake || !wake.n) return;
-
-  const dstar = st.boundaryLayer.wake.deltaStar;
-  const hz = spanCells / 2;
-  const N = Math.min(wake.n, dstar.length);
-  if (N < 2) return;
-
-  const P = [0, 0];
-  for (let i = 0; i < N - 1; i++) {
-    // Ramp the alpha down along the wake; the far wake is barely there.
-    const f = i / (N - 1);
-    const alpha = 0.3 * (1 - f) * (1 - f);
-    if (alpha < 0.004) break;
-
-    const seg = [];
-    let ok = true;
-    for (const [idx, side] of [[i, 1], [i + 1, 1], [i + 1, -1], [i, -1]]) {
-      // The wake line is in solver coordinates; its thickness is laid off
-      // perpendicular to it, then the whole thing is taken into view axes by
-      // the same transform the section outline uses. Note X/Y are the wake
-      // *nodes* (nw + 1 of them), not the panel midpoints.
-      const wx = wake.X[idx];
-      const wy = wake.Y[idx];
-      const half = Math.max(dstar[idx], 1e-4) * 1.6;
-      solverToView(F, wx, wy + side * half, P);
-      if (!project(P3, P[0], P[1], 0)) {
-        ok = false;
-        break;
-      }
-      seg.push([PRJ[0], PRJ[1]]);
-    }
-    if (!ok || seg.length < 4) continue;
-
-    ctx.fillStyle = `rgba(120, 170, 235, ${alpha.toFixed(3)})`;
-    ctx.beginPath();
-    ctx.moveTo(seg[0][0], seg[0][1]);
-    for (let k = 1; k < 4; k++) ctx.lineTo(seg[k][0], seg[k][1]);
-    ctx.closePath();
-    ctx.fill();
-  }
-  void hz;
-}
-
-/** Stagnation point and the separation onset stations, marked on the surface. */
-function drawSurfacePoints3D(ctx, F, P3, layers) {
-  const st = F.state;
-  const geo = F.solver.geometry;
-  if (!st || !geo) return;
-
-  const dot = (idx, colour, label) => {
-    if (!(idx >= 0 && idx < F.polyCount)) return;
-    if (!project(P3, F.poly[2 * idx], F.poly[2 * idx + 1], 0)) return;
-    const x = PRJ[0];
-    const y = PRJ[1];
-    ctx.fillStyle = colour;
-    ctx.beginPath();
-    ctx.arc(x, y, 4.5, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(10, 16, 30, 0.85)';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-    if (label) {
-      ctx.fillStyle = 'rgba(223, 230, 240, 0.92)';
-      ctx.font = '11px ui-sans-serif, system-ui, sans-serif';
-      ctx.fillText(label, x + 7, y - 6);
-    }
-  };
-
-  const nearestOnSurface = (xc, upper) => {
-    let best = -1;
-    let bestD = Infinity;
-    for (let i = 0; i < geo.n; i++) {
-      if (i > st.velocity.stagnationIndex !== upper) continue;
-      const d = Math.abs(geo.midX[i] - xc);
-      if (d < bestD) {
-        bestD = d;
-        best = i;
-      }
-    }
-    return best;
-  };
-
-  if (layers.stagnation) dot(st.velocity.stagnationIndex, '#8fe3a0', 'stagnation');
-  if (layers.separation) {
-    if (st.separation.upperX >= 0) dot(nearestOnSurface(st.separation.upperX, true), '#f2545b', 'sep');
-    if (st.separation.lowerX >= 0) dot(nearestOnSurface(st.separation.lowerX, false), '#f2545b', null);
-  }
 }
 
 /**
@@ -864,16 +627,8 @@ function render3D(ctx, F, St, cam, spanCells, viz) {
   const hz = spanCells / 2;
   const target = [F.pivotX, PIVOT_Y, 0];
   const P3 = makeProjection(cam, target, spanCells);
-  const layers = viz.layers;
 
   drawDomainBox(ctx, P3, spanCells);
-
-  // Mid-span field layers first, so the wing paints over the half of them that
-  // is behind it. They lie in the z = 0 plane that cuts the wing in two, so a
-  // strict depth sort would interleave them quad by quad for no visible gain.
-  if (layers.contours) drawPressureContours(ctx, F, P3);
-  if (layers.wake) drawWakeVolume(ctx, F, P3, spanCells);
-  if (layers.vectors) drawVelocityVectors(ctx, F, P3);
 
   drawLen = 0;
   ORDER.length = 0;
@@ -917,8 +672,6 @@ function render3D(ctx, F, St, cam, spanCells, viz) {
     WING_OK[k] = okN && okF ? 1 : 0;
   }
 
-  const blState = layers.separation ? F.state?.boundaryLayer.state : null;
-
   for (let k = 0; k < WING_N; k++) {
     const k2 = (k + 1) % WING_N;
     if (!WING_OK[k] || !WING_OK[k2]) continue;
@@ -934,7 +687,6 @@ function render3D(ctx, F, St, cam, spanCells, viz) {
       WING_T0[k] = (NODE_VAL[i] - heat.lo) / span;
       WING_T1[k] = (NODE_VAL[j] - heat.lo) / span;
     }
-    WING_SEP[k] = blState && blState[i] === 2 ? 1 : 0;
     pushDraw((NEAR_D[k] + NEAR_D[k2] + FAR_D[k] + FAR_D[k2]) * 0.25, 0, k, WING_SHADE[k]);
   }
 
@@ -950,7 +702,7 @@ function render3D(ctx, F, St, cam, spanCells, viz) {
 
   // --- Tracers ------------------------------------------------------------
   const margin = 60;
-  for (let i = 0; layers.streamlines && i < STREAK_COUNT; i++) {
+  for (let i = 0; i < STREAK_COUNT; i++) {
     if (St.count[i] < 3) continue;
     const z = St.sz[i] * spanCells;
     if (!project(P3, St.x[i], St.y[i], z)) continue;
@@ -1008,13 +760,6 @@ function render3D(ctx, F, St, cam, spanCells, viz) {
       ctx.closePath();
       ctx.fill();
       ctx.stroke();
-
-      // Separated panels get a hatched red wash, which reads as "this is not
-      // attached flow" without hiding the heat-map value underneath it.
-      if (WING_SEP[k]) {
-        ctx.fillStyle = 'rgba(242, 84, 91, 0.34)';
-        ctx.fill();
-      }
       continue;
     }
 
@@ -1116,7 +861,6 @@ function render3D(ctx, F, St, cam, spanCells, viz) {
   }
 
   // --- Overlays, always on top --------------------------------------------
-  drawSurfacePoints3D(ctx, F, P3, layers);
   pickSurface(F, P3, viz.hover, heatOn ? heat : null);
   if (heatOn) drawHoverTip(ctx, viz.hover, heat.mode);
 }
@@ -1160,18 +904,6 @@ export default function WindTunnel({
   const [heatModeId, setHeatModeId] = useState(DEFAULT_MODE);
   const [scaleId, setScaleId] = useState(DEFAULT_SCALE);
   const [showHeatInfo, setShowHeatInfo] = useState(false);
-  const [layers, setLayers] = useState({
-    streamlines: true,
-    vectors: false,
-    contours: false,
-    wake: true,
-    stagnation: true,
-    separation: true,
-  });
-  const toggleLayer = useCallback(
-    (key) => setLayers((L) => ({ ...L, [key]: !L[key] })),
-    []
-  );
 
   // Parsed only for immediate validation feedback while the user is typing; the
   // solver keeps running the last valid section until a complete one is entered.
@@ -1270,12 +1002,10 @@ export default function WindTunnel({
   if (vizRef.current === null) {
     vizRef.current = {
       heat: null,
-      layers,
       hover: { active: false, x: 0, y: 0, px: 0, py: 0, panel: -1, value: NaN, xc: 0, surface: '' },
     };
   }
   vizRef.current.heat = heat;
-  vizRef.current.layers = layers;
 
   // A geometry or incidence change moves the body under the tracers; any that
   // are now inside it, or trailing a ribbon through it, must be reseeded.
@@ -1633,13 +1363,6 @@ export default function WindTunnel({
               ))}
             </select>
 
-            {LAYER_TOGGLES.map(([key, label]) => (
-              <label key={key} className={styles.toggleLabel}>
-                <input type="checkbox" checked={layers[key]} onChange={() => toggleLayer(key)} />
-                {label}
-              </label>
-            ))}
-
             <button
               type="button"
               className={styles.heatmapInfoIcon}
@@ -1678,7 +1401,7 @@ export default function WindTunnel({
           <p className={styles.view3dNote}>
             The section is extruded equally either side of the mid-span plane, and that centre
             cross-section is exactly what the 2D view shows. The solve is two-dimensional, so every
-            spanwise station sees the same flow — no tip vortices, no downwash. Changing the span
+            spanwise station sees the same flow, with no tip vortices or downwash. Changing the span
             rescales the reported forces and nothing else; it does not re-run the solver, because
             there is nothing in the physics for it to change.
           </p>
@@ -1908,12 +1631,12 @@ function HeatLegend({ heat }) {
       <span>{formatHeatValue(lo, mode)}</span>
       <div className={styles.heatLegendBar} style={{ background: rampCss(scaleId) }} />
       <span>{formatHeatValue(hi, mode)}</span>
-      <span>{mode.symbol}</span>
+      <span className={styles.heatLegendSymbol}>{mode.symbol}</span>
     </div>
   );
 }
 
-/** What the current heat map is showing, and where the number comes from. */
+/** What the two dropdowns offer, option by option. */
 function HeatmapInfo({ heat, onClose }) {
   return (
     <div className={styles.heatmapInfo}>
@@ -1924,23 +1647,43 @@ function HeatmapInfo({ heat, onClose }) {
         </button>
       </div>
       <div className={styles.heatmapInfoBody}>
-        {heat ? (
-          <p>{heat.mode.describe}</p>
-        ) : (
-          <p>Turn the surface heat map on to colour the section by a solved quantity.</p>
-        )}
-        <p className={styles.heatmapInfoNote}>
-          Every mode reads directly off the converged viscous–inviscid solution — the same state the
-          lift, drag and pressure readouts come from — so the colour at a point on the surface and
-          the number in the dashboard are the same number. Hover the model to read the local value.
+        <p>
+          Two dropdowns choose what the colour on the surface means and how it is turned into
+          colour. Everything here reads directly off the same converged solution the lift, drag and
+          pressure readouts come from, so the colour at a point on the surface and the number in the
+          dashboard are the same number. Hover the model to read the local value.
         </p>
+
+        <div className={styles.heatmapInfoSection}>Heat map quantity</div>
+        <dl>
+          {HEAT_MODES.map((m) => (
+            <React.Fragment key={m.id}>
+              <dt>
+                <span className={styles.heatmapInfoSymbol}>{m.symbol}</span>
+                {m.label}
+                {m.signed ? ' · signed' : ''}
+                {m.robust ? ' · outlier clipped' : ''}
+              </dt>
+              <dd>{m.describe}</dd>
+            </React.Fragment>
+          ))}
+        </dl>
+
+        <div className={styles.heatmapInfoSection}>Colour scale</div>
+        <dl>
+          {COLOR_SCALES.map((s) => (
+            <React.Fragment key={s.id}>
+              <dt>{s.label}{s.diverging ? ' · diverging' : ''}</dt>
+              <dd>{s.describe}</dd>
+            </React.Fragment>
+          ))}
+        </dl>
+
         <p className={styles.heatmapInfoNote}>
-          The spectral scale is the familiar CFD blue-to-red. It is not perceptually uniform:
-          lightness rises to yellow and falls again to red, so the eye tends to invent edges at the
-          hue boundaries. <strong>Viridis</strong> is monotonic in lightness and stays readable with
-          any common colour-vision deficiency, and <strong>cool → warm</strong> pins its neutral
-          midpoint to zero, which is the honest encoding for the signed quantities (Cp and
-          vorticity).
+          Signed quantities (Cp and wall vorticity) automatically switch to a diverging scale pinned
+          symmetrically about zero, so the neutral midpoint of the ramp lands on zero and the two
+          poles mean equal and opposite. Vorticity is also clipped for outliers, because the
+          stagnation region would otherwise flatten the whole scale onto one colour.
         </p>
       </div>
     </div>
