@@ -215,14 +215,27 @@ function stationForTau(tau) {
  * and no kink.
  */
 function closedSurfacePoint(x, side, spec, te) {
-  const p = surfacePoint(x, side, spec);
+  const p = sectionSurface(x, side, spec);
   const t = side > 0 ? te.upper : te.lower;
   return [p[0] - x * (t[0] - te.x), p[1] - x * (t[1] - te.y)];
 }
 
+/**
+ * The surface equation for whichever section this is.
+ *
+ * Specs from sections.js carry their own surface, which is how Clark Y and the
+ * flat plate get panelled by exactly this pipeline. A bare NACA spec — what
+ * `parseNacaCode` returns, and what the validation harness passes in directly —
+ * has no `surface`, so it falls back to the NACA equations and produces the
+ * identical ring it always did.
+ */
+function sectionSurface(x, side, spec) {
+  return spec.surface ? spec.surface(x, side) : surfacePoint(x, side, spec);
+}
+
 function trailingEdge(spec) {
-  const upper = surfacePoint(1, 1, spec);
-  const lower = surfacePoint(1, -1, spec);
+  const upper = sectionSurface(1, 1, spec);
+  const lower = sectionSurface(1, -1, spec);
   return { upper, lower, x: 0.5 * (upper[0] + lower[0]), y: 0.5 * (upper[1] + lower[1]) };
 }
 

@@ -29,7 +29,14 @@
  *                       rescaled and the solver is not run.
  */
 
-import { parseNacaCode, zeroLiftAngle, maxCamber } from './naca.js';
+import { parseNacaCode } from './naca.js';
+import {
+  parseSection,
+  sectionKey,
+  sectionZeroLiftAngle,
+  sectionMaxCamber,
+  DEFAULT_GEOMETRY,
+} from './sections.js';
 import { buildBody, panelGeometry } from './geometry.js';
 import {
   buildPanelSystem,
@@ -67,6 +74,10 @@ export const NU_AIR = 1.48e-5; // m^2/s
 const DALPHA = (1 * Math.PI) / 180;
 
 const DEFAULTS = {
+  // Which section to panel. 'naca' reads `naca`; the other shapes in
+  // sections.js are self-describing. Defaulting to 'naca' keeps every existing
+  // caller — which passes only `naca` — on exactly the path it was on.
+  geometry: DEFAULT_GEOMETRY,
   naca: '2412',
   alphaDeg: 5,
   airspeed: 30, // m/s
@@ -124,9 +135,13 @@ export class AeroSolver {
     const prev = this.inputs;
     const t0 = now();
 
+    // Keyed on the section identity rather than on the NACA code alone, so
+    // switching to Clark Y or the flat plate invalidates the matrices the same
+    // way a new code does — and so a *re-render* that produces an equal spec
+    // does not.
     const geometryChanged =
       !prev ||
-      next.naca !== prev.naca ||
+      sectionKey(next) !== sectionKey(prev) ||
       next.panels !== prev.panels ||
       next.maxPanels !== prev.maxPanels ||
       !this._sys;
@@ -160,7 +175,7 @@ export class AeroSolver {
     /* ---- Geometry and matrices ------------------------------------------- */
     if (geometryChanged) {
       const tg = now();
-      const parsed = parseNacaCode(next.naca);
+      const parsed = parseSection(next);
       if (!parsed.ok) {
         this.buildError = parsed.error;
         return this.state;
@@ -499,11 +514,12 @@ export class AeroSolver {
         label: spec.label,
         key: spec.key,
         series: spec.series,
+        geometry: spec.geometry ?? 'naca',
         thickness: spec.t,
-        camber: maxCamber(spec),
+        camber: sectionMaxCamber(spec),
         // Thin-airfoil zero-lift angle, computed analytically from the camber
         // line. Independent of the panel solve, so it doubles as a check on it.
-        zeroLiftAngleThin: zeroLiftAngle(spec),
+        zeroLiftAngleThin: sectionZeroLiftAngle(spec),
         warning: spec.warning,
         panels: n,
       },

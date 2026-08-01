@@ -37,9 +37,23 @@ import {
   updateFlow,
   fillField,
   sampleFlow,
+  solverToView,
 } from './flow.js';
 import { parseNacaCode } from './solver/naca.js';
+import { GEOMETRIES, DEFAULT_GEOMETRY } from './solver/sections.js';
 import { RHO_AIR, NU_AIR } from './solver/index.js';
+import {
+  COLOR_SCALES,
+  HEAT_MODES,
+  DEFAULT_MODE,
+  DEFAULT_SCALE,
+  getMode,
+  getScale,
+  heatDomain,
+  rampColor,
+  rampCss,
+  formatHeatValue,
+} from './viz/heatmap.js';
 
 /* ============================================================================
  * 1. Configuration
@@ -98,6 +112,20 @@ const GOLDEN = 0.6180339887; // low-discrepancy spawn spacing
 // section outline update on the same commit as the slider; the contour catches
 // up over the next few frames.
 const FIELD_BUDGET_MS = 4;
+
+/**
+ * The optional flow-feature layers, in the order the toolbar lists them.
+ * Streamlines are the tracer ribbons that were always there; the rest are new
+ * views of the same converged state.
+ */
+const LAYER_TOGGLES = [
+  ['streamlines', 'Streamlines'],
+  ['vectors', 'Velocity vectors'],
+  ['contours', 'Pressure contours'],
+  ['wake', 'Wake'],
+  ['stagnation', 'Stagnation point'],
+  ['separation', 'Separation'],
+];
 
 /* ============================================================================
  * 2. Colour
@@ -474,6 +502,33 @@ const FAR_Y = new Float64Array(WING_CAP);
 const FAR_D = new Float64Array(WING_CAP);
 const WING_SHADE = new Float64Array(WING_CAP);
 const WING_OK = new Uint8Array(WING_CAP);
+// Normalised heat-map position at each end of a wing quad, so the fill can be a
+// gradient between them rather than one flat colour per panel.
+const WING_T0 = new Float64Array(WING_CAP);
+const WING_T1 = new Float64Array(WING_CAP);
+const WING_SEP = new Uint8Array(WING_CAP); // 1 where the boundary layer has separated
+
+// Per-outline-node heat value, averaged from the two panels meeting at it. The
+// solver's arrays are per panel; the mesh is drawn between nodes.
+let NODE_VAL = new Float64Array(0);
+
+const RGB_A = [0, 0, 0];
+const RGB_B = [0, 0, 0];
+
+/**
+ * Blend a ramp colour with the diffuse shading term.
+ *
+ * The heat map has to carry the data *and* the surface still has to read as a
+ * three-dimensional object. Multiplying the ramp colour by the lambert term
+ * would do the second at the cost of the first — a dark blue panel facing away
+ * from the light becomes indistinguishable from black. So the shading is
+ * applied as a partial lift toward white/black around a mid grey, which keeps
+ * the hue intact and only modulates its brightness over a limited range.
+ */
+function shadeRgb(rgb, shade) {
+  const f = 0.55 + 0.45 * shade;
+  return `rgb(${(rgb[0] * f) | 0},${(rgb[1] * f) | 0},${(rgb[2] * f) | 0})`;
+}
 
 /** Faint wireframe of the flow domain, for spatial orientation. */
 function drawDomainBox(ctx, P3, spanCells) {
@@ -499,8 +554,309 @@ function drawDomainBox(ctx, P3, spanCells) {
   ctx.stroke();
 }
 
+/* ---- Flow-feature layers -------------------------------------------------
+ *
+ * Everything below is drawn in the mid-span plane (z = 0). The solve is two-
+ * dimensional and every spanwise station sees the identical flow, so drawing
+ * these at every station would add no information and a great deal of clutter —
+ * the mid-span plane is the section the 2D view already shows, placed in space.
+ * ------------------------------------------------------------------------*/
+
+const VEC_STEP_CELLS = 22; // grid spacing for the velocity-vector field
+const VEC_LEN_CELLS = 13; // arrow length at freestream speed
+
+/** Velocity vectors on a coarse grid, coloured and scaled by local speed. */
+function drawVelocityVectors(ctx, F, P3) {
+  ctx.lineWidth = 1.2;
+  for (let y = VEC_STEP_CELLS; y < NY; y += VEC_STEP_CELLS) {
+    for (let x = VEC_STEP_CELLS; x < NX; x += VEC_STEP_CELLS) {
+      if (F.solid[(y | 0) * NX + (x | 0)]) continue;
+      sampleFlow(F, x, y, VEL);
+      const sp = Math.hypot(VEL[0], VEL[1]);
+      if (sp < 1e-4) continue;
+      const L = VEC_LEN_CELLS * Math.min(1.6, sp);
+      const x1 = x + (VEL[0] / sp) * L;
+      const y1 = y + (VEL[1] / sp) * L;
+
+      if (!project(P3, x, y, 0)) continue;
+      const ax = PRJ[0];
+      const ay = PRJ[1];
+      if (!project(P3, x1, y1, 0)) continue;
+      const bx = PRJ[0];
+      const by = PRJ[1];
+
+      ctx.strokeStyle = speedColor(sp);
+      ctx.beginPath();
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(bx, by);
+      // Arrow head, built in screen space so it stays legible at any depth.
+      const dx = bx - ax;
+      const dy = by - ay;
+      const dl = Math.hypot(dx, dy) || 1;
+      const hx = (dx / dl) * 4;
+      const hy = (dy / dl) * 4;
+      ctx.moveTo(bx, by);
+      ctx.lineTo(bx - hx + hy * 0.55, by - hy - hx * 0.55);
+      ctx.moveTo(bx, by);
+      ctx.lineTo(bx - hx - hy * 0.55, by - hy + hx * 0.55);
+      ctx.stroke();
+    }
+  }
+}
+
+const CONTOUR_LEVELS = [-1.6, -1.1, -0.7, -0.4, -0.2, 0, 0.2, 0.45, 0.7];
+const CONTOUR_STEP = 4; // field cells between marching-squares samples
+
+/**
+ * Pressure contours in the mid-span plane, by marching squares.
+ *
+ * Cp is not stored on the field grid, but for this incompressible potential
+ * outer flow it is exactly 1 - |V|^2 with |V| normalised on the freestream —
+ * the same Bernoulli relation the surface pressure comes from — so the contours
+ * are of the same pressure field the forces were integrated from, not a
+ * separate estimate of it.
+ */
+function drawPressureContours(ctx, F, P3) {
+  if (!F.fieldReady) return;
+  const cpAt = (x, y) => {
+    if (F.solid[(y | 0) * NX + (x | 0)]) return NaN;
+    sampleFlow(F, x, y, VEL);
+    const s2 = VEL[0] * VEL[0] + VEL[1] * VEL[1];
+    return 1 - s2;
+  };
+
+  ctx.lineWidth = 1;
+  for (const level of CONTOUR_LEVELS) {
+    // Cool for suction, warm for pressure, mid grey at Cp = 0 — a diverging
+    // encoding, because Cp has a sign and a meaningful zero.
+    const t = Math.max(0, Math.min(1, (level + 1.6) / 2.3));
+    ctx.strokeStyle =
+      level === 0
+        ? 'rgba(200, 212, 230, 0.5)'
+        : `hsla(${(215 - 215 * t).toFixed(0)}, 78%, 62%, 0.42)`;
+    ctx.beginPath();
+    for (let y = 1; y < NY - CONTOUR_STEP; y += CONTOUR_STEP) {
+      for (let x = 1; x < NX - CONTOUR_STEP; x += CONTOUR_STEP) {
+        const a = cpAt(x, y);
+        const b = cpAt(x + CONTOUR_STEP, y);
+        const c = cpAt(x + CONTOUR_STEP, y + CONTOUR_STEP);
+        const d = cpAt(x, y + CONTOUR_STEP);
+        if (!(Number.isFinite(a) && Number.isFinite(b) && Number.isFinite(c) && Number.isFinite(d))) {
+          continue;
+        }
+        // Only the two dominant cases are drawn; the saddle cases are rare at
+        // this sampling and their omission costs a pixel of contour, not a
+        // wrong contour.
+        const seg = [];
+        const lerp = (x0, y0, v0, x1, y1, v1) => {
+          const f = (level - v0) / (v1 - v0 || 1);
+          return [x0 + (x1 - x0) * f, y0 + (y1 - y0) * f];
+        };
+        if (a > level !== b > level) seg.push(lerp(x, y, a, x + CONTOUR_STEP, y, b));
+        if (b > level !== c > level) {
+          seg.push(lerp(x + CONTOUR_STEP, y, b, x + CONTOUR_STEP, y + CONTOUR_STEP, c));
+        }
+        if (c > level !== d > level) {
+          seg.push(lerp(x + CONTOUR_STEP, y + CONTOUR_STEP, c, x, y + CONTOUR_STEP, d));
+        }
+        if (d > level !== a > level) seg.push(lerp(x, y + CONTOUR_STEP, d, x, y, a));
+        if (seg.length < 2) continue;
+        if (!project(P3, seg[0][0], seg[0][1], 0)) continue;
+        const sx = PRJ[0];
+        const sy = PRJ[1];
+        if (!project(P3, seg[1][0], seg[1][1], 0)) continue;
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(PRJ[0], PRJ[1]);
+      }
+    }
+    ctx.stroke();
+  }
+}
+
+/**
+ * The wake, as a translucent volume trailing the trailing edge.
+ *
+ * Its half-height is the boundary-layer displacement thickness carried into the
+ * wake by the solver, so the shape is the computed wake and not a decorative
+ * cone: a section with an attached boundary layer gets a thin ribbon, and one
+ * that has separated gets the thick lobe its displacement thickness actually
+ * grew into. Opacity falls downstream because the momentum deficit is being
+ * diffused away, which is the same reason the real wake fades.
+ */
+function drawWakeVolume(ctx, F, P3, spanCells) {
+  const st = F.state;
+  const wake = F.solver.sourceWake;
+  if (!st || !wake || !wake.n) return;
+
+  const dstar = st.boundaryLayer.wake.deltaStar;
+  const hz = spanCells / 2;
+  const N = Math.min(wake.n, dstar.length);
+  if (N < 2) return;
+
+  const P = [0, 0];
+  for (let i = 0; i < N - 1; i++) {
+    // Ramp the alpha down along the wake; the far wake is barely there.
+    const f = i / (N - 1);
+    const alpha = 0.3 * (1 - f) * (1 - f);
+    if (alpha < 0.004) break;
+
+    const seg = [];
+    let ok = true;
+    for (const [idx, side] of [[i, 1], [i + 1, 1], [i + 1, -1], [i, -1]]) {
+      // The wake line is in solver coordinates; its thickness is laid off
+      // perpendicular to it, then the whole thing is taken into view axes by
+      // the same transform the section outline uses. Note X/Y are the wake
+      // *nodes* (nw + 1 of them), not the panel midpoints.
+      const wx = wake.X[idx];
+      const wy = wake.Y[idx];
+      const half = Math.max(dstar[idx], 1e-4) * 1.6;
+      solverToView(F, wx, wy + side * half, P);
+      if (!project(P3, P[0], P[1], 0)) {
+        ok = false;
+        break;
+      }
+      seg.push([PRJ[0], PRJ[1]]);
+    }
+    if (!ok || seg.length < 4) continue;
+
+    ctx.fillStyle = `rgba(120, 170, 235, ${alpha.toFixed(3)})`;
+    ctx.beginPath();
+    ctx.moveTo(seg[0][0], seg[0][1]);
+    for (let k = 1; k < 4; k++) ctx.lineTo(seg[k][0], seg[k][1]);
+    ctx.closePath();
+    ctx.fill();
+  }
+  void hz;
+}
+
+/** Stagnation point and the separation onset stations, marked on the surface. */
+function drawSurfacePoints3D(ctx, F, P3, layers) {
+  const st = F.state;
+  const geo = F.solver.geometry;
+  if (!st || !geo) return;
+
+  const dot = (idx, colour, label) => {
+    if (!(idx >= 0 && idx < F.polyCount)) return;
+    if (!project(P3, F.poly[2 * idx], F.poly[2 * idx + 1], 0)) return;
+    const x = PRJ[0];
+    const y = PRJ[1];
+    ctx.fillStyle = colour;
+    ctx.beginPath();
+    ctx.arc(x, y, 4.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(10, 16, 30, 0.85)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    if (label) {
+      ctx.fillStyle = 'rgba(223, 230, 240, 0.92)';
+      ctx.font = '11px ui-sans-serif, system-ui, sans-serif';
+      ctx.fillText(label, x + 7, y - 6);
+    }
+  };
+
+  const nearestOnSurface = (xc, upper) => {
+    let best = -1;
+    let bestD = Infinity;
+    for (let i = 0; i < geo.n; i++) {
+      if (i > st.velocity.stagnationIndex !== upper) continue;
+      const d = Math.abs(geo.midX[i] - xc);
+      if (d < bestD) {
+        bestD = d;
+        best = i;
+      }
+    }
+    return best;
+  };
+
+  if (layers.stagnation) dot(st.velocity.stagnationIndex, '#8fe3a0', 'stagnation');
+  if (layers.separation) {
+    if (st.separation.upperX >= 0) dot(nearestOnSurface(st.separation.upperX, true), '#f2545b', 'sep');
+    if (st.separation.lowerX >= 0) dot(nearestOnSurface(st.separation.lowerX, false), '#f2545b', null);
+  }
+}
+
+/**
+ * Hover readout, drawn straight onto the canvas.
+ *
+ * Deliberately not React state: the pointer moves every frame, and routing that
+ * through a re-render would re-reconcile the whole dashboard sixty times a
+ * second to move a tooltip. The camera already works this way.
+ */
+function drawHoverTip(ctx, hover, mode) {
+  if (!hover.active || hover.panel < 0) return;
+  const text = `${mode.symbol} ${formatHeatValue(hover.value, mode)}`;
+  const sub = `x/c ${hover.xc.toFixed(3)} · ${hover.surface}`;
+
+  ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+  const w = Math.max(ctx.measureText(text).width, ctx.measureText(sub).width) + 16;
+  const h = 34;
+  // Flip the box to stay inside the viewport near the edges.
+  const x = Math.min(hover.x + 12, VIEW3D_W - w - 4);
+  const y = Math.min(Math.max(hover.y - h - 10, 4), VIEW3D_H - h - 4);
+
+  ctx.fillStyle = 'rgba(13, 17, 23, 0.92)';
+  ctx.strokeStyle = 'rgba(120, 145, 180, 0.5)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  // roundRect is recent enough to be worth a fallback: this runs inside the
+  // animation loop, where an exception would take the whole render down.
+  if (ctx.roundRect) ctx.roundRect(x, y, w, h, 6);
+  else ctx.rect(x, y, w, h);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = '#dfe6f0';
+  ctx.fillText(text, x + 8, y + 15);
+  ctx.fillStyle = '#8b98ab';
+  ctx.font = '10px ui-sans-serif, system-ui, sans-serif';
+  ctx.fillText(sub, x + 8, y + 27);
+
+  ctx.strokeStyle = 'rgba(77, 163, 255, 0.9)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(hover.px, hover.py, 5, 0, Math.PI * 2);
+  ctx.stroke();
+}
+
+/**
+ * Resolve a pointer position to the nearest point on the projected surface.
+ *
+ * Runs against the mid-span outline rather than the full quad mesh: the wing is
+ * a constant extrusion, so the chordwise station is all that varies, and a
+ * nearest-point search over ~220 projected nodes is both simpler and cheaper
+ * than a ray cast through the quads.
+ */
+function pickSurface(F, P3, hover, heat) {
+  hover.panel = -1;
+  if (!hover.active || !F.state) return;
+  const n = F.polyCount;
+  let best = -1;
+  let bestD = 18 * 18; // px^2; beyond this the pointer is not on the section
+  let bx = 0;
+  let by = 0;
+  for (let i = 0; i < n; i++) {
+    if (!project(P3, F.poly[2 * i], F.poly[2 * i + 1], 0)) continue;
+    const dx = PRJ[0] - hover.x;
+    const dy = PRJ[1] - hover.y;
+    const d = dx * dx + dy * dy;
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+      bx = PRJ[0];
+      by = PRJ[1];
+    }
+  }
+  if (best < 0) return;
+  hover.panel = best;
+  hover.px = bx;
+  hover.py = by;
+  hover.value = heat && heat.values ? heat.values[best] : NaN;
+  hover.xc = F.solver.geometry ? F.solver.geometry.midX[best] : 0;
+  hover.surface = best > F.state.velocity.stagnationIndex ? 'upper surface' : 'lower surface';
+}
+
 /** Draw the extruded wing and the tracers into the 3D viewport. */
-function render3D(ctx, F, St, cam, spanCells) {
+function render3D(ctx, F, St, cam, spanCells, viz) {
   ctx.fillStyle = '#0a101e';
   ctx.fillRect(0, 0, VIEW3D_W, VIEW3D_H);
   if (F.polyCount < 3) return;
@@ -508,11 +864,32 @@ function render3D(ctx, F, St, cam, spanCells) {
   const hz = spanCells / 2;
   const target = [F.pivotX, PIVOT_Y, 0];
   const P3 = makeProjection(cam, target, spanCells);
+  const layers = viz.layers;
 
   drawDomainBox(ctx, P3, spanCells);
 
+  // Mid-span field layers first, so the wing paints over the half of them that
+  // is behind it. They lie in the z = 0 plane that cuts the wing in two, so a
+  // strict depth sort would interleave them quad by quad for no visible gain.
+  if (layers.contours) drawPressureContours(ctx, F, P3);
+  if (layers.wake) drawWakeVolume(ctx, F, P3, spanCells);
+  if (layers.vectors) drawVelocityVectors(ctx, F, P3);
+
   drawLen = 0;
   ORDER.length = 0;
+
+  // --- Heat map: per-node surface values ----------------------------------
+  // Averaged onto the nodes here rather than in the draw loop, because a node is
+  // shared by two quads and would otherwise be averaged twice.
+  const heat = viz.heat;
+  const heatOn = !!(heat && heat.values && heat.values.length === F.polyCount);
+  if (heatOn) {
+    if (NODE_VAL.length !== F.polyCount) NODE_VAL = new Float64Array(F.polyCount);
+    const v = heat.values;
+    const n = F.polyCount;
+    for (let i = 0; i < n; i++) NODE_VAL[i] = 0.5 * (v[(i - 1 + n) % n] + v[i]);
+  }
+  const span = heatOn ? heat.hi - heat.lo || 1 : 1;
 
   // --- Wing: one quad per outline edge, spanning the full wing -------------
   // The section is constant along span, so no spanwise subdivision is needed.
@@ -540,6 +917,8 @@ function render3D(ctx, F, St, cam, spanCells) {
     WING_OK[k] = okN && okF ? 1 : 0;
   }
 
+  const blState = layers.separation ? F.state?.boundaryLayer.state : null;
+
   for (let k = 0; k < WING_N; k++) {
     const k2 = (k + 1) % WING_N;
     if (!WING_OK[k] || !WING_OK[k2]) continue;
@@ -551,6 +930,11 @@ function render3D(ctx, F, St, cam, spanCells) {
     // The ring winds clockwise, for which (-dy, dx) points out of the section.
     const diffuse = Math.max(0, (-ey / el) * LX + (ex / el) * LY);
     WING_SHADE[k] = 0.22 + 0.78 * diffuse;
+    if (heatOn) {
+      WING_T0[k] = (NODE_VAL[i] - heat.lo) / span;
+      WING_T1[k] = (NODE_VAL[j] - heat.lo) / span;
+    }
+    WING_SEP[k] = blState && blState[i] === 2 ? 1 : 0;
     pushDraw((NEAR_D[k] + NEAR_D[k2] + FAR_D[k] + FAR_D[k2]) * 0.25, 0, k, WING_SHADE[k]);
   }
 
@@ -566,7 +950,7 @@ function render3D(ctx, F, St, cam, spanCells) {
 
   // --- Tracers ------------------------------------------------------------
   const margin = 60;
-  for (let i = 0; i < STREAK_COUNT; i++) {
+  for (let i = 0; layers.streamlines && i < STREAK_COUNT; i++) {
     if (St.count[i] < 3) continue;
     const z = St.sz[i] * spanCells;
     if (!project(P3, St.x[i], St.y[i], z)) continue;
@@ -586,11 +970,35 @@ function render3D(ctx, F, St, cam, spanCells) {
       const k = item.index;
       const k2 = (k + 1) % WING_N;
       const sh = item.shade;
-      const col = `rgb(${(232 * sh) | 0},${(237 * sh) | 0},${(245 * sh) | 0})`;
-      ctx.fillStyle = col;
+
+      let fill;
+      let edge;
+      if (heatOn) {
+        // Gradient along the chordwise direction of the quad. The scalar is
+        // constant along the span by construction, so the gradient axis is the
+        // line joining the two quad ends at mid-span — the closest a linear
+        // gradient can get to "constant along span" once the quad has been
+        // projected, and visually indistinguishable from it at these angles.
+        rampColor(heat.scaleId, WING_T0[k], RGB_A);
+        rampColor(heat.scaleId, WING_T1[k], RGB_B);
+        const ax = (NEAR_X[k] + FAR_X[k]) * 0.5;
+        const ay = (NEAR_Y[k] + FAR_Y[k]) * 0.5;
+        const bx = (NEAR_X[k2] + FAR_X[k2]) * 0.5;
+        const by = (NEAR_Y[k2] + FAR_Y[k2]) * 0.5;
+        const g = ctx.createLinearGradient(ax, ay, bx, by);
+        g.addColorStop(0, shadeRgb(RGB_A, sh));
+        g.addColorStop(1, shadeRgb(RGB_B, sh));
+        fill = g;
+        edge = shadeRgb(RGB_A, sh);
+      } else {
+        edge = `rgb(${(232 * sh) | 0},${(237 * sh) | 0},${(245 * sh) | 0})`;
+        fill = edge;
+      }
+
+      ctx.fillStyle = fill;
       // Stroke with the fill colour too: adjacent quads are antialiased along
       // their shared edge, which otherwise leaves a visible seam.
-      ctx.strokeStyle = col;
+      ctx.strokeStyle = edge;
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(NEAR_X[k], NEAR_Y[k]);
@@ -600,6 +1008,13 @@ function render3D(ctx, F, St, cam, spanCells) {
       ctx.closePath();
       ctx.fill();
       ctx.stroke();
+
+      // Separated panels get a hatched red wash, which reads as "this is not
+      // attached flow" without hiding the heat-map value underneath it.
+      if (WING_SEP[k]) {
+        ctx.fillStyle = 'rgba(242, 84, 91, 0.34)';
+        ctx.fill();
+      }
       continue;
     }
 
@@ -699,7 +1114,24 @@ function render3D(ctx, F, St, cam, spanCells) {
       }
     }
   }
+
+  // --- Overlays, always on top --------------------------------------------
+  drawSurfacePoints3D(ctx, F, P3, layers);
+  pickSurface(F, P3, viz.hover, heatOn ? heat : null);
+  if (heatOn) drawHoverTip(ctx, viz.hover, heat.mode);
 }
+
+/**
+ * Renderer internals, exposed only so validation/render3d.check.mjs can drive a
+ * real frame against a stub canvas in node. Not part of the component API — the
+ * component takes props and nothing else.
+ *
+ * This exists because a throw inside requestAnimationFrame is invisible: the
+ * bundle builds, the page loads, and the canvas simply stops. A missing
+ * `solverToView` import did exactly that to the 3D view, and the only way to
+ * catch that class of bug short of a browser is to execute the draw path.
+ */
+export const __internals = { render3D, createStreaks, createCamera };
 
 /* ============================================================================
  * 6. Component
@@ -707,6 +1139,7 @@ function render3D(ctx, F, St, cam, spanCells) {
 
 export default function WindTunnel({
   initialNacaCode = '2412',
+  initialGeometry = DEFAULT_GEOMETRY,
   initialAirspeed = 30,
   initialAoa = 5,
   initialChordCm = CHORD_DEFAULT_CM,
@@ -721,15 +1154,38 @@ export default function WindTunnel({
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [activeTab, setActiveTab] = useState('2d');
 
+  // --- Visualisation -------------------------------------------------------
+  const [geometry, setGeometry] = useState(initialGeometry);
+  const [showHeat, setShowHeat] = useState(true);
+  const [heatModeId, setHeatModeId] = useState(DEFAULT_MODE);
+  const [scaleId, setScaleId] = useState(DEFAULT_SCALE);
+  const [showHeatInfo, setShowHeatInfo] = useState(false);
+  const [layers, setLayers] = useState({
+    streamlines: true,
+    vectors: false,
+    contours: false,
+    wake: true,
+    stagnation: true,
+    separation: true,
+  });
+  const toggleLayer = useCallback(
+    (key) => setLayers((L) => ({ ...L, [key]: !L[key] })),
+    []
+  );
+
   // Parsed only for immediate validation feedback while the user is typing; the
   // solver keeps running the last valid section until a complete one is entered.
-  const parsed = useMemo(() => parseNacaCode(code), [code]);
+  // Only the NACA geometry has anything to validate — the others are built-in.
+  const parsed = useMemo(
+    () => (geometry === 'naca' ? parseNacaCode(code) : { ok: true }),
+    [code, geometry]
+  );
   const [validCode, setValidCode] = useState(() =>
     parseNacaCode(initialNacaCode).ok ? initialNacaCode : '2412'
   );
   useEffect(() => {
-    if (parsed.ok) setValidCode(code);
-  }, [parsed, code]);
+    if (parsed.ok && geometry === 'naca') setValidCode(code);
+  }, [parsed, code, geometry]);
 
   const flowRef = useRef(null);
   if (flowRef.current === null) flowRef.current = createFlow();
@@ -742,6 +1198,7 @@ export default function WindTunnel({
   const state = useMemo(() => {
     const F = flowRef.current;
     return updateFlow(F, {
+      geometry,
       naca: validCode,
       alphaDeg: aoa,
       airspeed,
@@ -750,7 +1207,21 @@ export default function WindTunnel({
       rho: RHO_AIR,
       nu: NU_AIR,
     });
-  }, [validCode, aoa, airspeed, chordCm, spanRatio]);
+  }, [geometry, validCode, aoa, airspeed, chordCm, spanRatio]);
+
+  /* --- The surface heat map ------------------------------------------------
+   * Derived from the same converged state as everything else, so the colour at
+   * a point on the wing and the number in the dashboard cannot disagree. The
+   * domain is recomputed with the state, which is what makes the scale track
+   * the flow as the angle of attack moves. */
+  const heat = useMemo(() => {
+    if (!state || !showHeat) return null;
+    const mode = getMode(heatModeId);
+    const scale = getScale(scaleId);
+    const values = mode.values(state);
+    const { lo, hi } = heatDomain(values, mode, scale);
+    return { values, mode, scale, scaleId: scale.id, lo, hi };
+  }, [state, showHeat, heatModeId, scaleId]);
 
   const readings = useMemo(() => {
     if (!state) return null;
@@ -792,11 +1263,25 @@ export default function WindTunnel({
   const activeTabRef = useRef(activeTab);
   activeTabRef.current = activeTab;
 
+  // Everything the 3D renderer needs that is not the flow itself. Mutated in
+  // place rather than replaced, so the hover record — which the render loop
+  // writes the pick result back into — survives a re-render.
+  const vizRef = useRef(null);
+  if (vizRef.current === null) {
+    vizRef.current = {
+      heat: null,
+      layers,
+      hover: { active: false, x: 0, y: 0, px: 0, py: 0, panel: -1, value: NaN, xc: 0, surface: '' },
+    };
+  }
+  vizRef.current.heat = heat;
+  vizRef.current.layers = layers;
+
   // A geometry or incidence change moves the body under the tracers; any that
   // are now inside it, or trailing a ribbon through it, must be reseeded.
   useEffect(() => {
     streaksRef.current.seeded = false;
-  }, [validCode, aoa, chordCm]);
+  }, [geometry, validCode, aoa, chordCm]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -837,7 +1322,7 @@ export default function WindTunnel({
       renderFrame(ctx, field, fieldCtx, fieldImage, F, St);
 
       if (ctx3d && activeTabRef.current === '3d') {
-        render3D(ctx3d, F, St, camRef.current, spanRatioRef.current * F.nCells);
+        render3D(ctx3d, F, St, camRef.current, spanRatioRef.current * F.nCells, vizRef.current);
       }
     };
 
@@ -870,14 +1355,25 @@ export default function WindTunnel({
       if (el.setPointerCapture) el.setPointerCapture(e.pointerId);
     };
     const onMove = (e) => {
-      if (!cam.dragging) return;
       const [x, y] = pos(e);
+      // The pointer position goes into a ref and is resolved to a surface point
+      // by the render loop, which already has the projection to hand. Nothing
+      // here touches React state, so hovering costs no re-renders.
+      const hov = vizRef.current.hover;
+      hov.x = x;
+      hov.y = y;
+      hov.active = !cam.dragging;
+
+      if (!cam.dragging) return;
       cam.az -= (x - cam.lastX) * 0.006;
       cam.el += (y - cam.lastY) * 0.006;
       if (cam.el < CAM_MIN_EL) cam.el = CAM_MIN_EL;
       if (cam.el > CAM_MAX_EL) cam.el = CAM_MAX_EL;
       cam.lastX = x;
       cam.lastY = y;
+    };
+    const onLeave = () => {
+      vizRef.current.hover.active = false;
     };
     const onUp = (e) => {
       cam.dragging = false;
@@ -900,12 +1396,14 @@ export default function WindTunnel({
     el.addEventListener('pointermove', onMove);
     el.addEventListener('pointerup', onUp);
     el.addEventListener('pointercancel', onUp);
+    el.addEventListener('pointerleave', onLeave);
     el.addEventListener('wheel', onWheel, { passive: false });
     return () => {
       el.removeEventListener('pointerdown', onDown);
       el.removeEventListener('pointermove', onMove);
       el.removeEventListener('pointerup', onUp);
       el.removeEventListener('pointercancel', onUp);
+      el.removeEventListener('pointerleave', onLeave);
       el.removeEventListener('wheel', onWheel);
     };
   }, []);
@@ -952,6 +1450,26 @@ export default function WindTunnel({
 
       <div className={styles.topBar}>
         <div className={styles.control}>
+          <label className={styles.label} htmlFor="wt-geometry">
+            Geometry
+          </label>
+          <select
+            id="wt-geometry"
+            className={styles.select}
+            value={geometry}
+            onChange={(e) => setGeometry(e.target.value)}
+          >
+            {GEOMETRIES.map((g) => (
+              <option key={g.id} value={g.id}>
+                {g.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {/* The designation box belongs to the NACA geometry only; the other
+            sections are built in and have nothing to type. */}
+        <div className={`${styles.control} ${geometry === 'naca' ? '' : styles.controlHidden}`}>
           <label className={styles.label} htmlFor="wt-naca">
             NACA airfoil
           </label>
@@ -1036,7 +1554,12 @@ export default function WindTunnel({
       </div>
 
       {!parsed.ok && <div className={styles.error}>{parsed.error}</div>}
-      {parsed.ok && parsed.warning && <div className={styles.warning}>{parsed.warning}</div>}
+      {/* Read off the solved section rather than the parsed input, so it covers
+          every geometry — the flat plate's leading-edge separation caveat as
+          well as the 5-digit reflex-camber note. */}
+      {parsed.ok && readings?.airfoil.warning && (
+        <div className={styles.warning}>{readings.airfoil.warning}</div>
+      )}
       {flowRef.current.error && <div className={styles.error}>{flowRef.current.error}</div>}
 
       <div className={`${styles.body} ${activeTab === '2d' ? '' : styles.tabHidden}`}>
@@ -1074,6 +1597,66 @@ export default function WindTunnel({
       </div>
 
       {/* --- 3D view: the same solution extruded along the span ------------- */}
+      {activeTab === '3d' && (
+        <>
+          <div className={styles.toggleBar}>
+            <label className={styles.toggleLabel}>
+              <input type="checkbox" checked={showHeat} onChange={() => setShowHeat((v) => !v)} />
+              Surface heat map
+            </label>
+
+            <select
+              className={styles.selectSmall}
+              value={heatModeId}
+              onChange={(e) => setHeatModeId(e.target.value)}
+              disabled={!showHeat}
+              aria-label="Heat map quantity"
+            >
+              {HEAT_MODES.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+
+            <select
+              className={styles.selectSmall}
+              value={scaleId}
+              onChange={(e) => setScaleId(e.target.value)}
+              disabled={!showHeat}
+              aria-label="Colour scale"
+            >
+              {COLOR_SCALES.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.label}
+                </option>
+              ))}
+            </select>
+
+            {LAYER_TOGGLES.map(([key, label]) => (
+              <label key={key} className={styles.toggleLabel}>
+                <input type="checkbox" checked={layers[key]} onChange={() => toggleLayer(key)} />
+                {label}
+              </label>
+            ))}
+
+            <button
+              type="button"
+              className={styles.heatmapInfoIcon}
+              onClick={() => setShowHeatInfo((v) => !v)}
+              aria-expanded={showHeatInfo}
+              aria-label="About the heat map"
+            >
+              <span className={styles.circleI}>i</span>
+            </button>
+
+            {heat && <HeatLegend heat={heat} />}
+          </div>
+
+          {showHeatInfo && <HeatmapInfo heat={heat} onClose={() => setShowHeatInfo(false)} />}
+        </>
+      )}
+
       <div className={`${styles.body} ${activeTab === '3d' ? '' : styles.tabHidden}`}>
         <div className={styles.viewport}>
           <canvas ref={canvas3dRef} width={VIEW3D_W} height={VIEW3D_H} className={styles.canvas3d} />
@@ -1307,6 +1890,59 @@ function InfoPanel({ readings, state }) {
         Solve time this update: {state?.timing.total.toFixed(0)} ms
         {state?.mode === 'incremental' ? ' (incremental, warm-started)' : ' (full convergence)'}.
       </p>
+    </div>
+  );
+}
+
+/**
+ * The heat-map legend.
+ *
+ * A colour scale without its range is decoration, so the bar always ships with
+ * both ends labelled and the units named. The bar itself is generated from the
+ * same baked ramp the wing is painted with, so the two cannot drift apart.
+ */
+function HeatLegend({ heat }) {
+  const { mode, lo, hi, scaleId } = heat;
+  return (
+    <div className={styles.heatLegend}>
+      <span>{formatHeatValue(lo, mode)}</span>
+      <div className={styles.heatLegendBar} style={{ background: rampCss(scaleId) }} />
+      <span>{formatHeatValue(hi, mode)}</span>
+      <span>{mode.symbol}</span>
+    </div>
+  );
+}
+
+/** What the current heat map is showing, and where the number comes from. */
+function HeatmapInfo({ heat, onClose }) {
+  return (
+    <div className={styles.heatmapInfo}>
+      <div className={styles.heatmapInfoHeader}>
+        <span>{heat ? heat.mode.label : 'Surface heat map'}</span>
+        <button type="button" className={styles.heatmapInfoClose} onClick={onClose} aria-label="Close">
+          ×
+        </button>
+      </div>
+      <div className={styles.heatmapInfoBody}>
+        {heat ? (
+          <p>{heat.mode.describe}</p>
+        ) : (
+          <p>Turn the surface heat map on to colour the section by a solved quantity.</p>
+        )}
+        <p className={styles.heatmapInfoNote}>
+          Every mode reads directly off the converged viscous–inviscid solution — the same state the
+          lift, drag and pressure readouts come from — so the colour at a point on the surface and
+          the number in the dashboard are the same number. Hover the model to read the local value.
+        </p>
+        <p className={styles.heatmapInfoNote}>
+          The spectral scale is the familiar CFD blue-to-red. It is not perceptually uniform:
+          lightness rises to yellow and falls again to red, so the eye tends to invent edges at the
+          hue boundaries. <strong>Viridis</strong> is monotonic in lightness and stays readable with
+          any common colour-vision deficiency, and <strong>cool → warm</strong> pins its neutral
+          midpoint to zero, which is the honest encoding for the signed quantities (Cp and
+          vorticity).
+        </p>
+      </div>
     </div>
   );
 }

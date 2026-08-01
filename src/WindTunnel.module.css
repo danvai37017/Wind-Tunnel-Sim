@@ -708,7 +708,9 @@
 
 /* ---- Hover tooltip ------------------------------------------------------- */
 
-.hoverTooltip {
+/* The 3D hover readout is drawn onto the canvas, not composited over it — see
+   drawHoverTip. Kept here for the 2D view should it ever want a DOM tooltip. */
+.hoverTooltipUnused {
   position: absolute;
   padding: 5px 9px;
   border: 1px solid var(--wt-border);
